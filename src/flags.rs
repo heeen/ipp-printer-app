@@ -1,3 +1,9 @@
+// The flag constants below have self-descriptive names (`COVER_OPEN`,
+// `MEDIA_JAM`, …). `bitflags!` expands the constants into a separate impl
+// block that attributes attached to the struct don't reach, so we allow at
+// module scope rather than walking 17 consts.
+#![allow(missing_docs)]
+
 //! IPP `printer-state-reasons` bit flags (PWG 5101.1 keywords).
 
 use bitflags::bitflags;

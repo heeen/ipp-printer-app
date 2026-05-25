@@ -9,11 +9,13 @@ use parking_lot::RwLock;
 
 use crate::flags::PrinterReason;
 
+/// Monotonic job-id allocated by [`JobRegistry::create`].
 pub type JobId = u32;
 
 /// IPP `job-state` enum (RFC 8011 §5.3.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+#[allow(missing_docs)]
 pub enum JobState {
     Pending = 3,
     Held = 4,
@@ -25,6 +27,8 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// True for `Canceled` / `Aborted` / `Completed` — the registry will
+    /// not transition out of these states.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Canceled | Self::Aborted | Self::Completed)
     }
@@ -32,6 +36,7 @@ impl JobState {
 
 /// One job in the per-server registry.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub struct JobRecord {
     pub id: JobId,
     pub printer_name: String,
@@ -50,10 +55,13 @@ impl JobRecord {
         secs_since_epoch(self.created_at)
     }
 
+    /// Seconds since epoch for `time-at-completed`. `None` while still active.
     pub fn completed_secs(&self) -> Option<i32> {
         self.completed_at.map(secs_since_epoch)
     }
 
+    /// True once `Cancel-Job` has been observed. Workers should check this
+    /// between scanlines / pages.
     pub fn is_canceled(&self) -> bool {
         self.cancel_flag.load(Ordering::Acquire)
     }
@@ -83,6 +91,7 @@ impl Default for JobRegistry {
 }
 
 impl JobRegistry {
+    /// Empty registry with `next_id = 1`.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner {
@@ -113,10 +122,12 @@ impl JobRegistry {
         rec
     }
 
+    /// Look up a job by id. Returns a clone so the caller doesn't hold the lock.
     pub fn get(&self, id: JobId) -> Option<JobRecord> {
         self.inner.read().jobs.iter().find(|j| j.id == id).cloned()
     }
 
+    /// All jobs that target the named printer. Order is allocation order.
     pub fn jobs_for_printer(&self, printer_name: &str) -> Vec<JobRecord> {
         self.inner
             .read()
@@ -127,6 +138,8 @@ impl JobRegistry {
             .collect()
     }
 
+    /// Force a job into `state`. Stamps `completed_at` when crossing into a
+    /// terminal state. No-op if the id doesn't exist.
     pub fn set_state(&self, id: JobId, state: JobState) {
         let mut g = self.inner.write();
         if let Some(j) = g.jobs.iter_mut().find(|j| j.id == id) {

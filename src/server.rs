@@ -28,6 +28,7 @@ use crate::state::PersistedState;
 /// Context passed to a print-job worker so it can observe cancellation and
 /// report progress without re-querying the registry.
 #[derive(Clone)]
+#[allow(missing_docs)]
 pub struct JobContext {
     pub id: JobId,
     pub printer_name: String,
@@ -44,7 +45,8 @@ pub type PrintJobFn = Arc<
         + Sync,
 >;
 
-/// Server configuration.
+/// Server configuration. Construct in your `main`, hand to [`Server::run`].
+#[allow(missing_docs)]
 pub struct ServerOptions {
     pub host: String,
     pub port: u16,
@@ -54,8 +56,10 @@ pub struct ServerOptions {
     pub state_path: std::path::PathBuf,
 }
 
-/// Shared axum state.
+/// Axum-shared state. Constructed internally by [`Server::router`]; exposed
+/// only so external middleware can read the printer registry.
 #[derive(Clone)]
+#[allow(missing_docs)]
 pub struct AppState {
     pub host: String,
     pub port: u16,
@@ -66,9 +70,12 @@ pub struct AppState {
     pub device_backend: Arc<dyn DeviceBackend>,
 }
 
+/// Entry point — `Server::run(opts).await` starts the listener.
 pub struct Server;
 
 impl Server {
+    /// Build the axum router with the configured state attached. Returned
+    /// router can be served via [`Server::run`] or by hand.
     pub fn router(opts: ServerOptions) -> Router {
         let state = AppState {
             host: opts.host.clone(),
@@ -87,6 +94,9 @@ impl Server {
             .with_state(state)
     }
 
+    /// Bind to `host:port`, spawn the background status poller (and the mDNS
+    /// advertiser if the `mdns` feature is enabled), and run the axum
+    /// listener until it errors.
     pub async fn run(opts: ServerOptions) -> std::io::Result<()> {
         let addr = format!("{}:{}", opts.host, opts.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -142,6 +152,9 @@ impl Server {
         Self::persist(registry, state_path);
     }
 
+    /// Snapshot the registry to `state_path` as JSON. Called automatically
+    /// at the end of every print job; expose for callers that want to
+    /// persist after manual registry edits.
     pub fn persist(registry: &PrinterRegistry, state_path: &std::path::Path) {
         let configs: Vec<_> = registry
             .read()

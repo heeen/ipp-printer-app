@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::printer::PrinterConfig;
 
+/// What the framework persists between runs — just the registered printers.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[allow(missing_docs)]
 pub struct PersistedState {
     pub printers: Vec<PrinterConfig>,
 }
 
 impl PersistedState {
+    /// Read from `path`. Missing / unparseable file → empty state (no error).
     pub fn load(path: &Path) -> Self {
         match fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
@@ -20,6 +23,7 @@ impl PersistedState {
         }
     }
 
+    /// Write to `path` as pretty JSON. Creates parent dirs.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;

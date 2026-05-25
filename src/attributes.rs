@@ -432,10 +432,12 @@ fn job_state_reason_keywords(job: &crate::job::JobRecord) -> Vec<&'static str> {
     out
 }
 
+/// Transition the printer into `IppPrinterState::Processing`.
 pub fn set_printer_processing(record: &mut PrinterRecord) {
     record.state = IppPrinterState::Processing;
 }
 
+/// Transition the printer back to `IppPrinterState::Idle`.
 pub fn set_printer_idle(record: &mut PrinterRecord) {
     record.state = IppPrinterState::Idle;
 }

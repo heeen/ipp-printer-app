@@ -1,9 +1,10 @@
 //! Background `printer-state-reasons` poller.
 //!
-//! A single tokio task per server walks the printer registry every
-//! [`POLL_INTERVAL`] and asks the backend for fresh status. Backends that don't
-//! implement [`DeviceBackend::poll_status`] return `None` and leave the
-//! registry untouched.
+//! A single tokio task per server walks the printer registry every poll
+//! interval (default 30 s, override with `IPP_PRINTER_APP_POLL_SECS`) and
+//! asks the backend for fresh status. Backends that don't override
+//! [`DeviceBackend::poll_status`] return `None` and leave the registry
+//! untouched.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -1,3 +1,5 @@
+#![deny(missing_docs)]
+
 //! Pure-Rust IPP Everywhere framework for building CUPS-driverless
 //! "printer applications" — the modern replacement for the PPD-driven
 //! filter+backend model.

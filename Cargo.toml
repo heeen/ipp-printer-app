@@ -37,3 +37,4 @@ mdns-sd = { version = "0.19", optional = true }
 
 [dev-dependencies]
 ipp = { version = "6", default-features = false }
+env_logger = "0.11"
