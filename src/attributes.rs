@@ -79,7 +79,6 @@ pub fn get_printer_attributes(
         port
     );
 
-    // --- Required header / identity attributes ---
     let p = DelimiterTag::PrinterAttributes;
     add(attrs, p, "printer-uri-supported", uri(&printer_uri_str));
     add(attrs, p, "uri-authentication-supported", kw("none"));
@@ -122,14 +121,12 @@ pub fn get_printer_attributes(
         IppValue::Integer(uptime_secs() as i32),
     );
 
-    // --- State ---
     add(attrs, p, "printer-state", IppValue::Enum(record.state as i32));
     let reason_kws: Vec<&str> = record.reasons.ipp_keywords();
     add_array_keyword(attrs, p, "printer-state-reasons", &reason_kws);
     add(attrs, p, "printer-is-accepting-jobs", IppValue::Boolean(true));
     add(attrs, p, "queued-job-count", IppValue::Integer(0));
 
-    // --- Versions / operations / charset / language ---
     add_array_keyword(attrs, p, "ipp-versions-supported", &["1.1", "2.0", "2.1"]);
     add_array_keyword(
         attrs,
@@ -171,7 +168,6 @@ pub fn get_printer_attributes(
     );
     add_array_keyword(attrs, p, "compression-supported", &["none"]);
 
-    // --- Document format ---
     // PWG raster is the IPP Everywhere required format; the unified CUPS reader
     // also handles legacy CUPS raster v1/v2 if a client picks that path.
     add(
@@ -214,7 +210,6 @@ pub fn get_printer_attributes(
         &["W8", "SRGB24", "CP1", "RS203"],
     );
 
-    // --- Color / sides / orientation ---
     add(attrs, p, "color-supported", IppValue::Boolean(false));
     add_array_keyword(attrs, p, "print-color-mode-supported", &["monochrome"]);
     add(attrs, p, "print-color-mode-default", kw("monochrome"));
@@ -222,7 +217,6 @@ pub fn get_printer_attributes(
     add(attrs, p, "sides-default", kw("one-sided"));
     add(attrs, p, "orientation-requested-default", IppValue::Enum(3));
 
-    // --- Resolution ---
     add(
         attrs,
         p,
@@ -244,7 +238,6 @@ pub fn get_printer_attributes(
         }]),
     );
 
-    // --- Media ---
     let media_kws: Vec<&str> = cfg.media_names.iter().map(|s| s.as_str()).collect();
     if !media_kws.is_empty() {
         add(attrs, p, "media-default", kw(media_kws[0]));
@@ -266,7 +259,6 @@ pub fn get_printer_attributes(
         add(attrs, p, "media-col-supported", IppValue::Array(media_cols));
     }
 
-    // --- Job template defaults / supported (live in printer-attributes group) ---
     add(
         attrs,
         p,

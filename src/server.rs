@@ -152,23 +152,12 @@ impl Server {
     }
 }
 
+/// Generic slug used as the proposed printer name during bootstrap. The
+/// `make_config` callback receives this as its first arg and is free to
+/// override by returning a [`PrinterConfig`] with a different `name`.
 fn printer_name_from_uri(uri: &str, info: &str) -> String {
-    if let Some(serial) = uri.strip_prefix("usbhid://") {
-        let s: String = serial
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        if !s.is_empty() {
-            return format!("supvan-{s}");
-        }
-    }
-    if let Some(rest) = uri.strip_prefix("btrfcomm://") {
-        if let Some(addr) = rest.split('/').nth(1) {
-            let compact: String = addr.chars().filter(|c| *c != ':').collect();
-            return format!("supvan-{compact}");
-        }
-    }
-    let base: String = info
+    let source = if info.is_empty() { uri } else { info };
+    let slug: String = source
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -178,14 +167,24 @@ fn printer_name_from_uri(uri: &str, info: &str) -> String {
             }
         })
         .collect();
-    format!("supvan-{base}")
+    let trimmed = slug.trim_matches('-');
+    let collapsed: String = trimmed
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        "printer".to_string()
+    } else {
+        collapsed
+    }
 }
 
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     let printers = state.printers.read();
     let mut html = String::from(
-        "<!DOCTYPE html><html><head><title>Supvan Printer Application</title></head><body>\
-         <h1>Supvan Printer Application</h1><ul>",
+        "<!DOCTYPE html><html><head><title>ipp-printer-app</title></head><body>\
+         <h1>ipp-printer-app</h1><ul>",
     );
     for p in printers.iter() {
         let uri = p.config.printer_uri(&state.host, state.port);
@@ -194,7 +193,16 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
             p.config.name, p.config.device_uri
         ));
     }
-    html.push_str("</ul><p>CUPS: <code>lpadmin -p NAME -E -v ipp://localhost:8631/ipp/print/NAME -m everywhere</code></p></body></html>");
+    html.push_str(&format!(
+        "</ul><p>Register with CUPS: <code>lpadmin -p NAME -E -v \
+         ipp://{}:{}/ipp/print/NAME -m everywhere</code></p></body></html>",
+        if state.host.is_empty() || state.host == "0.0.0.0" || state.host == "::" {
+            "localhost"
+        } else {
+            &state.host
+        },
+        state.port,
+    ));
     (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
 }
 

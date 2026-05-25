@@ -1,14 +1,17 @@
-//! IPP `printer-state-reasons` bit flags (PWG values).
+//! IPP `printer-state-reasons` bit flags (PWG 5101.1 keywords).
 
 use bitflags::bitflags;
 
+/// Underlying integer representation for [`PrinterReason`].
 pub type PrinterReasonRaw = u32;
 
 bitflags! {
-    /// Printer state reason flags (`printer-state-reasons`).
+    /// `printer-state-reasons` flags. Use [`PrinterReason::empty`] for
+    /// "no reasons"; do NOT define a `NONE = 0` constant — bitflags
+    /// `.contains(zero)` is always `true`, making it a footgun.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[allow(missing_docs)]
     pub struct PrinterReason: PrinterReasonRaw {
-        const NONE = 0x0000;
         const OTHER = 0x0001;
         const COVER_OPEN = 0x0002;
         const INPUT_TRAY_MISSING = 0x0004;
@@ -30,41 +33,36 @@ bitflags! {
 }
 
 impl PrinterReason {
-    /// IPP keyword tokens for this flag set (CUPS / PWG).
+    /// PWG keyword tokens for this flag set, in the order CUPS expects.
+    /// An empty set yields `["none"]`.
     pub fn ipp_keywords(&self) -> Vec<&'static str> {
-        let mut out = Vec::new();
         if self.is_empty() {
-            out.push("none");
-            return out;
+            return vec!["none"];
         }
-        if self.contains(Self::OTHER) {
-            out.push("other");
-        }
-        if self.contains(Self::COVER_OPEN) {
-            out.push("cover-open");
-        }
-        if self.contains(Self::MEDIA_EMPTY) {
-            out.push("media-empty");
-        }
-        if self.contains(Self::MEDIA_JAM) {
-            out.push("media-jam");
-        }
-        if self.contains(Self::MEDIA_LOW) {
-            out.push("media-low");
-        }
-        if self.contains(Self::OFFLINE) {
-            out.push("offline-report");
-        }
-        if self.contains(Self::MARKER_SUPPLY_LOW) {
-            out.push("marker-supply-low");
-        }
-        if self.contains(Self::MARKER_SUPPLY_EMPTY) {
-            out.push("marker-supply-empty");
-        }
-        if out.is_empty() {
-            out.push("none");
-        }
-        out
+        let table = [
+            (Self::OTHER, "other"),
+            (Self::COVER_OPEN, "cover-open"),
+            (Self::DOOR_OPEN, "door-open"),
+            (Self::INPUT_TRAY_MISSING, "input-tray-missing"),
+            (Self::MARKER_SUPPLY_EMPTY, "marker-supply-empty"),
+            (Self::MARKER_SUPPLY_LOW, "marker-supply-low"),
+            (Self::MARKER_WASTE_ALMOST_FULL, "marker-waste-almost-full"),
+            (Self::MARKER_WASTE_FULL, "marker-waste-full"),
+            (Self::MEDIA_EMPTY, "media-empty"),
+            (Self::MEDIA_JAM, "media-jam"),
+            (Self::MEDIA_LOW, "media-low"),
+            (Self::MEDIA_NEEDED, "media-needed"),
+            (Self::OFFLINE, "offline-report"),
+            (Self::SPOOL_AREA_FULL, "spool-area-full"),
+            (Self::TONER_EMPTY, "toner-empty"),
+            (Self::TONER_LOW, "toner-low"),
+            (Self::IDENTIFY_PRINTER_REQUESTED, "identify-printer-requested"),
+        ];
+        table
+            .into_iter()
+            .filter(|(bit, _)| self.contains(*bit))
+            .map(|(_, kw)| kw)
+            .collect()
     }
 }
 

@@ -1,9 +1,9 @@
 //! mDNS / DNS-SD advertising for IPP printers (`_ipp._tcp.local.`).
 //!
-//! Off by default; enable via the `mdns` feature on this crate. When enabled,
-//! [`Advertiser::register_all`] publishes one service instance per printer in
-//! the registry, with the TXT records CUPS / cups-browsed expect for
-//! IPP-Everywhere auto-discovery (RFC 8011 + Bonjour for IPP, PWG 5100.14).
+//! Gated by the default-on `mdns` feature. [`Advertiser::register_all`]
+//! publishes one service instance per printer in the registry, with the TXT
+//! records CUPS / cups-browsed need for IPP-Everywhere auto-discovery
+//! (RFC 8011 + Bonjour for IPP + PWG 5100.14).
 
 use std::collections::HashMap;
 
