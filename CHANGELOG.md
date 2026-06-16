@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0 — 2026-06-16
+
+Round out IPP Everywhere attribute coverage so CUPS' `lpadmin -m
+everywhere` PPD generator can construct a queue. 0.1.0 omitted the
+attributes CUPS uses to identify an IPP-Everywhere-capable printer
+(`ipp-features-supported`, `pdl-override-supported`,
+`printer-device-id`) and the descriptors its PPD template needs
+(`media-source-supported`, `media-type-supported`,
+`output-bin-supported`/`-default`, `print-content-optimize-supported`/
+`-default`, `finishings-supported`/`-default`,
+`job-creation-attributes-supported`). All are now emitted by
+`Get-Printer-Attributes` and `Validate-Job`.
+
+### Behaviour change
+
+- `Get-Printer-Attributes` responses are larger (~700 extra bytes per
+  printer). No existing fields changed shape, but downstream golden
+  fixtures will need refreshing if they pin the full response.
+
 ## 0.1.0 — 2026-05-25
 
 Initial release. A pure-Rust IPP Everywhere framework for building

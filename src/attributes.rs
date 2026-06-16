@@ -128,6 +128,16 @@ pub fn get_printer_attributes(
     add(attrs, p, "queued-job-count", IppValue::Integer(0));
 
     add_array_keyword(attrs, p, "ipp-versions-supported", &["1.1", "2.0", "2.1"]);
+    add_array_keyword(attrs, p, "ipp-features-supported", &["ipp-everywhere"]);
+    add(attrs, p, "pdl-override-supported", kw("attempted"));
+    if !cfg.device_id.is_empty() {
+        add(
+            attrs,
+            p,
+            "printer-device-id",
+            IppValue::TextWithoutLanguage(cfg.device_id.as_str().try_into().unwrap()),
+        );
+    }
     add_array_keyword(
         attrs,
         p,
@@ -193,15 +203,16 @@ pub fn get_printer_attributes(
         "pwg-raster-document-type-supported",
         &["black_1"],
     );
-    add(
+    // PWG 5102.4 §3.2.x: this attribute is a 1setOf keyword in the form
+    // "<dpi>dpi" or "<dpi>x<dpi>dpi". CUPS' everywhere PPD generator looks
+    // it up specifically as KEYWORD; declaring it as a Resolution makes
+    // `lpadmin -m everywhere` reject the printer.
+    let dpi_kw = format!("{}dpi", cfg.dpi);
+    add_array_keyword(
         attrs,
         p,
         "pwg-raster-document-resolution-supported",
-        IppValue::Array(vec![IppValue::Resolution {
-            cross_feed: cfg.dpi,
-            feed: cfg.dpi,
-            units: 3,
-        }]),
+        &[dpi_kw.as_str()],
     );
     add_array_keyword(
         attrs,
@@ -216,6 +227,34 @@ pub fn get_printer_attributes(
     add_array_keyword(attrs, p, "sides-supported", &["one-sided"]);
     add(attrs, p, "sides-default", kw("one-sided"));
     add(attrs, p, "orientation-requested-default", IppValue::Enum(3));
+
+    // IPP Everywhere required descriptors. We expose conservative defaults that
+    // satisfy CUPS' `-m everywhere` PPD generator without claiming features
+    // we don't implement (no real trays, no finishings).
+    add_array_keyword(attrs, p, "media-source-supported", &["main"]);
+    add_array_keyword(attrs, p, "media-type-supported", &["labels", "stationery"]);
+    add_array_keyword(attrs, p, "output-bin-supported", &["face-up"]);
+    add(attrs, p, "output-bin-default", kw("face-up"));
+    add_array_keyword(
+        attrs,
+        p,
+        "print-content-optimize-supported",
+        &["auto", "graphic", "photo", "text", "text-and-graphic"],
+    );
+    add(attrs, p, "print-content-optimize-default", kw("auto"));
+    add_array_keyword(attrs, p, "finishings-supported", &["none"]);
+    add(attrs, p, "finishings-default", IppValue::Enum(3));
+    add(attrs, p, "job-creation-attributes-supported", IppValue::Array(vec![
+        kw("copies"),
+        kw("media"),
+        kw("media-col"),
+        kw("orientation-requested"),
+        kw("print-color-mode"),
+        kw("print-content-optimize"),
+        kw("print-quality"),
+        kw("printer-resolution"),
+        kw("sides"),
+    ]));
 
     add(
         attrs,
@@ -256,7 +295,11 @@ pub fn get_printer_attributes(
             .zip(cfg.media_sizes.iter().copied().chain(std::iter::repeat(default_size)))
             .map(|(name, size)| media_col(name, size))
             .collect();
-        add(attrs, p, "media-col-supported", IppValue::Array(media_cols));
+        // CUPS' `lpadmin -m everywhere` PPD generator only walks `media-col-database`
+        // (PWG 5100.13) to enumerate sizes; `media-col-supported` is the capability
+        // surface and isn't iterated. Emit both with the same shape.
+        add(attrs, p, "media-col-supported", IppValue::Array(media_cols.clone()));
+        add(attrs, p, "media-col-database", IppValue::Array(media_cols));
     }
 
     add(
