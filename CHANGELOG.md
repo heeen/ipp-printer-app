@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 — 2026-06-18
+
+Bug fix: emit `pwg-raster-document-resolution-supported` as `1setOf
+resolution` (per PWG 5102.4 §6.2.1) instead of keyword. 0.2.0
+shipped it as keyword because CUPS 2.4.10 (Debian trixie) looks
+the attribute up via `IPP_TAG_KEYWORD`; CUPS 2.4.16+ (Ubuntu 26.04+)
+correctly uses `IPP_TAG_RESOLUTION` per the spec and rejects the
+keyword form, refusing to generate a PPD via `lpadmin -m everywhere`.
+
+The spec-correct form wins. Users on CUPS 2.4.10 lose `lpadmin -m
+everywhere` until they upgrade past the 2.4.x patch series that
+fixed the lookup tag.
+
 ## 0.2.0 — 2026-06-16
 
 Round out IPP Everywhere attribute coverage so CUPS' `lpadmin -m

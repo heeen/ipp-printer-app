@@ -203,16 +203,18 @@ pub fn get_printer_attributes(
         "pwg-raster-document-type-supported",
         &["black_1"],
     );
-    // PWG 5102.4 §3.2.x: this attribute is a 1setOf keyword in the form
-    // "<dpi>dpi" or "<dpi>x<dpi>dpi". CUPS' everywhere PPD generator looks
-    // it up specifically as KEYWORD; declaring it as a Resolution makes
-    // `lpadmin -m everywhere` reject the printer.
-    let dpi_kw = format!("{}dpi", cfg.dpi);
-    add_array_keyword(
+    // PWG 5102.4 §6.2.1: `1setOf resolution`. CUPS 2.4.16+ (Ubuntu 26.04)
+    // requires this typing; 2.4.10 (Debian trixie) regrettably has a bug
+    // and looks it up as IPP_TAG_KEYWORD instead — the spec form wins.
+    add(
         attrs,
         p,
         "pwg-raster-document-resolution-supported",
-        &[dpi_kw.as_str()],
+        IppValue::Array(vec![IppValue::Resolution {
+            cross_feed: cfg.dpi,
+            feed: cfg.dpi,
+            units: 3,
+        }]),
     );
     add_array_keyword(
         attrs,
