@@ -54,6 +54,15 @@ pub struct ServerOptions {
     pub device_backend: Arc<dyn DeviceBackend>,
     pub print_job: PrintJobFn,
     pub state_path: std::path::PathBuf,
+    /// When `true` (and the `mdns` feature is on), [`Server::run`] starts the
+    /// DNS-SD advertiser itself, immediately, from the registry as it stands
+    /// at bind time. Set `false` if the caller needs to advertise later —
+    /// e.g. after assigning each [`crate::printer::PrinterRecord::uuid`] from
+    /// an external source (a CUPS queue's `printer-uuid`) so the advertised
+    /// `UUID=` matches a local queue and cups-browsed dedupes it. The caller
+    /// is then responsible for calling [`crate::mdns::Advertiser::register_all`]
+    /// and holding the handle.
+    pub advertise_mdns: bool,
 }
 
 /// Axum-shared state. Constructed internally by [`Server::router`]; exposed
@@ -105,14 +114,19 @@ impl Server {
         // Background status poller — keeps printer-state-reasons fresh.
         let _status = crate::status::spawn(opts.device_backend.clone(), opts.printers.clone());
 
-        // mDNS advertising for IPP-Everywhere auto-discovery.
+        // mDNS advertising for IPP-Everywhere auto-discovery. Skipped when the
+        // caller opts to advertise itself later (see ServerOptions::advertise_mdns).
         #[cfg(feature = "mdns")]
-        let _advertiser = match crate::mdns::Advertiser::register_all(&opts.printers, opts.port) {
-            Ok(adv) => Some(adv),
-            Err(e) => {
-                log::warn!("mdns: failed to register printers: {e}");
-                None
+        let _advertiser = if opts.advertise_mdns {
+            match crate::mdns::Advertiser::register_all(&opts.printers, opts.port) {
+                Ok(adv) => Some(adv),
+                Err(e) => {
+                    log::warn!("mdns: failed to register printers: {e}");
+                    None
+                }
             }
+        } else {
+            None
         };
 
         axum::serve(listener, Self::router(opts)).await

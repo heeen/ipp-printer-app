@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0 — 2026-06-18
+
+DNS-SD discovery now plays nicely with a co-resident `cups-browsed`.
+
+- **Advertise `UUID=` in the `_ipp._tcp` TXT record** (was missing). The bare
+  uuid (the `urn:uuid:` prefix stripped) is taken from each
+  `PrinterRecord::uuid`. This is the key `cups-browsed` uses to dedupe a
+  discovered *local* service against an existing CUPS queue's `printer-uuid`
+  and stand down — the same mechanism CUPS's own shared queues rely on. It's
+  also expected by Bonjour-for-IPP / PWG 5100.14 conformance.
+- **New `ServerOptions.advertise_mdns: bool`** (breaking struct change). When
+  `false`, `Server::run` does not start the advertiser itself, letting the
+  caller assign each `PrinterRecord::uuid` (e.g. from the matching CUPS
+  queue's `printer-uuid`) and then advertise via the already-public
+  `mdns::Advertiser::register_all`, so the advertised `UUID=` matches a local
+  queue. Set `true` for the previous always-advertise-at-startup behaviour.
+
+### Migration
+
+Add `advertise_mdns: true` to existing `ServerOptions { … }` literals to keep
+0.2.x behaviour.
+
 ## 0.2.1 — 2026-06-18
 
 Bug fix: emit `pwg-raster-document-resolution-supported` as `1setOf

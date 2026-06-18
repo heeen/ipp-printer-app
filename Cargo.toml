@@ -1,6 +1,6 @@
 [package]
 name = "ipp-printer-app"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["Florian Hänel <heeen.de@gmail.com>"]

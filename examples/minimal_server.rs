@@ -80,6 +80,7 @@ async fn main() -> std::io::Result<()> {
             Ok(())
         }),
         state_path,
+        advertise_mdns: true,
     })
     .await
 }

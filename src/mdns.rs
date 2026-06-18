@@ -27,7 +27,13 @@ impl Advertiser {
         let host = hostname();
         let mut fullnames = Vec::new();
         for rec in registry.read().iter() {
-            let info = service_info(&host, port, &rec.config.name, &rec.config.make_and_model)?;
+            let info = service_info(
+                &host,
+                port,
+                &rec.config.name,
+                &rec.config.make_and_model,
+                &rec.uuid,
+            )?;
             let fullname = info.get_fullname().to_string();
             daemon.register(info)?;
             log::info!("mdns: registered {fullname}");
@@ -63,9 +69,18 @@ fn service_info(
     port: u16,
     name: &str,
     make_and_model: &str,
+    uuid: &str,
 ) -> mdns_sd::Result<ServiceInfo> {
     let mut txt: HashMap<String, String> = HashMap::new();
     txt.insert("rp".into(), format!("ipp/print/{name}"));
+    // `UUID=` lets a local cups-browsed dedupe this advert against a CUPS
+    // queue with the same `printer-uuid` and stand down (it's the same
+    // mechanism CUPS's own shared queues use). Advertise the bare value —
+    // cups-browsed strips `urn:uuid:` on the CUPS side before comparing.
+    let bare_uuid = uuid.strip_prefix("urn:uuid:").unwrap_or(uuid);
+    if !bare_uuid.is_empty() {
+        txt.insert("UUID".into(), bare_uuid.to_string());
+    }
     txt.insert("ty".into(), make_and_model.to_string());
     txt.insert("note".into(), make_and_model.to_string());
     txt.insert("product".into(), format!("({make_and_model})"));
