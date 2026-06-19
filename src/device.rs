@@ -26,4 +26,11 @@ pub trait DeviceBackend: Send + Sync {
     fn poll_status(&self, _config: &PrinterConfig) -> Option<PrinterReason> {
         None
     }
+
+    /// Handle an `Identify-Printer` request (PWG 5100.14 §5.1) — make the
+    /// physical device announce itself (beep, flash an LED, …). `actions`
+    /// holds the requested `identify-actions` keywords (`display`, `sound`,
+    /// `flash`, `speak`); an empty slice means "use the default action".
+    /// Default: no-op.
+    fn identify(&self, _config: &PrinterConfig, _actions: &[String]) {}
 }

@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.4.0 — 2026-06-19
+
+IPP Everywhere conformance pass. Validated against the canonical
+`ipptool ipp-everywhere.test` suite (which pulls in `ipp-1.1.test` and
+`ipp-2.0.test`): the RFC 8011 / PWG 5100.12 / PWG 5100.14 sections now pass
+end to end. The only remaining required item is `image/jpeg` decode (see
+below), which is a real capability gap rather than an encoding bug.
+
+### Conformance bug fixes (encoding / behaviour)
+
+- **`operations-supported` is now `1setOf enum`** carrying operation *codes*
+  (`0x0002`, `0x0004`, …) instead of keyword names. Strict clients and
+  conformance tools require the enum form.
+- **`finishings-supported` is now `1setOf enum`** (`3` = none), was a keyword.
+- **`media-col-supported` is now `1setOf keyword`** naming the settable
+  `media-col` member attributes (`media-size`, `media-*-margin`, …), not the
+  collections themselves. Real size collections remain in `media-col-database`.
+- **`requested-attributes` is honoured** for Get-Printer-Attributes, Get-Jobs,
+  and Get-Job-Attributes (incl. the `all` magic value and the Get-Jobs default
+  of `job-uri` + `job-id`).
+- **Request validation (RFC 8011 §4.1.1 / §4.1.4 / §4.1.8 / §4.2)**: reject
+  `request-id` 0, a missing / misordered `attributes-charset` +
+  `attributes-natural-language` pair, unsupported IPP versions, and requests
+  lacking a `printer-uri` / `job-uri` — each with the correct IPP status.
+- **`printer-up-time` is always > 0** (floored at 1 for first-second requests).
+
+### New required operations (PWG 5100.14 §5.1)
+
+- **Identify-Printer** (`0x3c`) + `identify-actions-{supported,default}`,
+  dispatched to the new `DeviceBackend::identify` hook (default no-op).
+- **Create-Job** (`0x05`) + **Send-Document** (`0x06`) multi-document flow
+  (Send-Document requires `last-document`), **Close-Job** (`0x3b`),
+  **Cancel-My-Jobs** (`0x39`). Jobs now record their `requesting-user-name`
+  owner so `Get-Jobs my-jobs=true` scopes correctly.
+
+### New required descriptor / job attributes
+
+- Media geometry: `media-size-supported`,
+  `media-{top,bottom,left,right}-margin-supported`, `media-ready` /
+  `media-col-ready` (static fallback from config; a backend can override
+  per-poll).
+- Job/limits: `multiple-document-jobs-supported`, `multiple-operation-time-out`
+  (+`-action`), `which-jobs-supported`, `job-ids-supported`,
+  `preferred-attributes-supported`, `overrides-supported`,
+  `printer-get-attributes-supported`, `orientation-requested-supported`.
+- Rendering: `print-rendering-intent-{default,supported}`,
+  `pwg-raster-document-sheet-back`.
+- Identity/admin: `printer-geo-location` (out-of-band `unknown`),
+  `printer-organization`, `printer-organizational-unit`, `printer-icons`
+  (served from a new `GET /icon.png` route), `pages-per-minute`,
+  `printer-supply` / `-description` / `-info-uri` (static fallback),
+  `printer-{config,state}-change-{date-time,time}`.
+- Per-job: `job-originating-user-name`, `time-at-processing`,
+  `job-printer-up-time`.
+
+### Known gap
+
+- `document-format-supported` does not yet include `image/jpeg`; IPP Everywhere
+  requires JPEG decode, which is not implemented. PWG/CUPS raster only.
+
+### Breaking changes
+
+- `DeviceBackend` gains an `identify` method (defaulted, so existing impls
+  compile unchanged).
+- `JobRegistry::create` now takes an `owner: String`.
+- `build_get_jobs_response` / `build_job_attrs_response` /
+  `get_printer_attributes` take an extra `requested` filter argument.
+
 ## 0.3.0 — 2026-06-18
 
 DNS-SD discovery now plays nicely with a co-resident `cups-browsed`.

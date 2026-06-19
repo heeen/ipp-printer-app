@@ -40,6 +40,9 @@ impl JobState {
 pub struct JobRecord {
     pub id: JobId,
     pub printer_name: String,
+    /// `requesting-user-name` from the creating operation (`anonymous` if the
+    /// client supplied none). Used to scope `Get-Jobs my-jobs=true`.
+    pub owner: String,
     pub state: JobState,
     pub reasons: PrinterReason,
     pub message: String,
@@ -101,16 +104,18 @@ impl JobRegistry {
         }
     }
 
-    /// Allocate a new pending job for `printer_name`. Returns a clone of the
-    /// record so the caller can stash the `JobId` and `cancel_flag` without
-    /// holding the registry lock.
-    pub fn create(&self, printer_name: String) -> JobRecord {
+    /// Allocate a new pending job for `printer_name`, owned by `owner`
+    /// (the `requesting-user-name`). Returns a clone of the record so the
+    /// caller can stash the `JobId` and `cancel_flag` without holding the
+    /// registry lock.
+    pub fn create(&self, printer_name: String, owner: String) -> JobRecord {
         let mut g = self.inner.write();
         let id = g.next_id;
         g.next_id = g.next_id.wrapping_add(1).max(1);
         let rec = JobRecord {
             id,
             printer_name,
+            owner,
             state: JobState::Pending,
             reasons: PrinterReason::empty(),
             message: String::new(),
@@ -183,8 +188,8 @@ mod tests {
     #[test]
     fn distinct_ids() {
         let reg = JobRegistry::new();
-        let a = reg.create("p".into());
-        let b = reg.create("p".into());
+        let a = reg.create("p".into(), "u".into());
+        let b = reg.create("p".into(), "u".into());
         assert_ne!(a.id, b.id);
         assert_eq!(a.state, JobState::Pending);
     }
@@ -192,7 +197,7 @@ mod tests {
     #[test]
     fn cancel_flips_flag_and_state() {
         let reg = JobRegistry::new();
-        let j = reg.create("p".into());
+        let j = reg.create("p".into(), "u".into());
         let flag = j.cancel_flag.clone();
         assert!(!flag.load(Ordering::Acquire));
         assert_eq!(reg.cancel(j.id), Some(JobState::Canceled));
@@ -203,7 +208,7 @@ mod tests {
     #[test]
     fn cancel_terminal_is_noop() {
         let reg = JobRegistry::new();
-        let j = reg.create("p".into());
+        let j = reg.create("p".into(), "u".into());
         reg.set_state(j.id, JobState::Completed);
         assert_eq!(reg.cancel(j.id), Some(JobState::Completed));
         assert!(!reg.get(j.id).unwrap().cancel_flag.load(Ordering::Acquire));
@@ -212,7 +217,7 @@ mod tests {
     #[test]
     fn failure_records_reasons_and_message() {
         let reg = JobRegistry::new();
-        let j = reg.create("p".into());
+        let j = reg.create("p".into(), "u".into());
         reg.set_failure(j.id, PrinterReason::MEDIA_EMPTY, "no labels".into());
         let after = reg.get(j.id).unwrap();
         assert_eq!(after.state, JobState::Aborted);
@@ -223,9 +228,9 @@ mod tests {
     #[test]
     fn jobs_for_printer_filters() {
         let reg = JobRegistry::new();
-        let _ = reg.create("a".into());
-        let _ = reg.create("b".into());
-        let _ = reg.create("a".into());
+        let _ = reg.create("a".into(), "u".into());
+        let _ = reg.create("b".into(), "u".into());
+        let _ = reg.create("a".into(), "u".into());
         assert_eq!(reg.jobs_for_printer("a").len(), 2);
         assert_eq!(reg.jobs_for_printer("b").len(), 1);
         assert_eq!(reg.jobs_for_printer("c").len(), 0);

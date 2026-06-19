@@ -1,5 +1,8 @@
 //! Build `Get-Printer-Attributes` / `Validate-Job` IPP responses.
 
+use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ipp::attribute::{IppAttribute, IppAttributes};
 use ipp::model::DelimiterTag;
 use ipp::prelude::*;
@@ -41,6 +44,54 @@ fn add_array_keyword(attrs: &mut IppAttributes, tag: DelimiterTag, name: &str, i
     add(attrs, tag, name, IppValue::Array(values));
 }
 
+fn text(s: &str) -> IppValue {
+    IppValue::TextWithoutLanguage(s.try_into().expect("text"))
+}
+
+fn add_array_enum(attrs: &mut IppAttributes, tag: DelimiterTag, name: &str, codes: &[i32]) {
+    let values: Vec<IppValue> = codes.iter().map(|c| IppValue::Enum(*c)).collect();
+    add(attrs, tag, name, IppValue::Array(values));
+}
+
+/// Break a Unix timestamp into a civil UTC `dateTime` value (Hinnant's
+/// `civil_from_days`). IPP `dateTime` (RFC 2579 / RFC 8011 §5.1.15).
+fn datetime_utc(unix_secs: i64) -> IppValue {
+    let days = unix_secs.div_euclid(86_400);
+    let rem = unix_secs.rem_euclid(86_400);
+    let (hour, minutes, seconds) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+
+    IppValue::DateTime {
+        year: year as u16,
+        month: month as u8,
+        day: day as u8,
+        hour: hour as u8,
+        minutes: minutes as u8,
+        seconds: seconds as u8,
+        deci_seconds: 0,
+        utc_dir: '+',
+        utc_hours: 0,
+        utc_mins: 0,
+    }
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Advertise localhost when the server bound to an unspecified address.
 fn advertise_host(host: &str) -> &str {
     if host == "0.0.0.0" || host == "::" || host.is_empty() {
@@ -61,12 +112,18 @@ fn printer_uri(record: &PrinterRecord, host: &str, port: u16) -> String {
 }
 
 /// Build a successful Get-Printer-Attributes response.
+///
+/// `requested` is the client's `requested-attributes` set. `None` (or a set
+/// containing the magic value `all`) returns the full attribute group; a
+/// concrete set filters the response down to the named attributes (RFC 8011
+/// §4.2.5).
 pub fn get_printer_attributes(
     version: IppVersion,
     request_id: u32,
     record: &PrinterRecord,
     host: &str,
     port: u16,
+    requested: Option<&BTreeSet<String>>,
 ) -> Result<IppRequestResponse, ipp::parser::IppParseError> {
     let mut resp =
         IppRequestResponse::new_response(version, StatusCode::SuccessfulOk, request_id)?;
@@ -114,11 +171,14 @@ pub fn get_printer_attributes(
         "printer-uuid",
         uri(&format!("urn:uuid:{}", record.uuid)),
     );
+    // RFC 8011 §5.4.29: seconds since the printer started; must be > 0 (the
+    // uptime clock starts lazily, so floor it at 1 for requests in the first
+    // second).
     add(
         attrs,
         p,
         "printer-up-time",
-        IppValue::Integer(uptime_secs() as i32),
+        IppValue::Integer(uptime_secs().max(1) as i32),
     );
 
     add(attrs, p, "printer-state", IppValue::Enum(record.state as i32));
@@ -138,17 +198,24 @@ pub fn get_printer_attributes(
             IppValue::TextWithoutLanguage(cfg.device_id.as_str().try_into().unwrap()),
         );
     }
-    add_array_keyword(
+    // RFC 8011 §5.4.15: `1setOf enum` carrying the operation *codes*, not
+    // keyword names. Order follows the numeric code.
+    add_array_enum(
         attrs,
         p,
         "operations-supported",
         &[
-            "Print-Job",
-            "Validate-Job",
-            "Get-Printer-Attributes",
-            "Get-Jobs",
-            "Get-Job-Attributes",
-            "Cancel-Job",
+            0x0002, // Print-Job
+            0x0004, // Validate-Job
+            0x0005, // Create-Job
+            0x0006, // Send-Document
+            0x0008, // Cancel-Job
+            0x0009, // Get-Job-Attributes
+            0x000a, // Get-Jobs
+            0x000b, // Get-Printer-Attributes
+            0x0039, // Cancel-My-Jobs
+            0x003b, // Close-Job
+            0x003c, // Identify-Printer
         ],
     );
     add(
@@ -229,6 +296,14 @@ pub fn get_printer_attributes(
     add_array_keyword(attrs, p, "sides-supported", &["one-sided"]);
     add(attrs, p, "sides-default", kw("one-sided"));
     add(attrs, p, "orientation-requested-default", IppValue::Enum(3));
+    // portrait / landscape / reverse-landscape / reverse-portrait (RFC 8011).
+    add_array_enum(attrs, p, "orientation-requested-supported", &[3, 4, 5, 6]);
+
+    // Identify-Printer actions (PWG 5100.14 §5.1). The framework dispatches
+    // the operation to `DeviceBackend::identify`; we advertise a display-type
+    // action which any backend can honour (a beep/LED maps to `sound`/`flash`).
+    add_array_keyword(attrs, p, "identify-actions-supported", &["display", "sound"]);
+    add_array_keyword(attrs, p, "identify-actions-default", &["display"]);
 
     // IPP Everywhere required descriptors. We expose conservative defaults that
     // satisfy CUPS' `-m everywhere` PPD generator without claiming features
@@ -244,7 +319,8 @@ pub fn get_printer_attributes(
         &["auto", "graphic", "photo", "text", "text-and-graphic"],
     );
     add(attrs, p, "print-content-optimize-default", kw("auto"));
-    add_array_keyword(attrs, p, "finishings-supported", &["none"]);
+    // RFC 8011 §5.2.6: `1setOf enum`. `3` == `none`.
+    add_array_enum(attrs, p, "finishings-supported", &[3]);
     add(attrs, p, "finishings-default", IppValue::Enum(3));
     add(attrs, p, "job-creation-attributes-supported", IppValue::Array(vec![
         kw("copies"),
@@ -284,7 +360,7 @@ pub fn get_printer_attributes(
         add(attrs, p, "media-default", kw(media_kws[0]));
         add_array_keyword(attrs, p, "media-supported", &media_kws);
 
-        // media-col-{default,supported} — required by IPP Everywhere.
+        // media-col-{default} — required by IPP Everywhere.
         let default_size = cfg.media_sizes.first().copied().unwrap_or([4000, 3000]);
         add(
             attrs,
@@ -297,11 +373,57 @@ pub fn get_printer_attributes(
             .zip(cfg.media_sizes.iter().copied().chain(std::iter::repeat(default_size)))
             .map(|(name, size)| media_col(name, size))
             .collect();
-        // CUPS' `lpadmin -m everywhere` PPD generator only walks `media-col-database`
-        // (PWG 5100.13) to enumerate sizes; `media-col-supported` is the capability
-        // surface and isn't iterated. Emit both with the same shape.
-        add(attrs, p, "media-col-supported", IppValue::Array(media_cols.clone()));
-        add(attrs, p, "media-col-database", IppValue::Array(media_cols));
+        // PWG 5100.13: `media-col-supported` is `1setOf keyword` naming the
+        // member attributes a client may set in a `media-col` collection — NOT
+        // the collections themselves (that's `media-col-database`, which CUPS'
+        // `lpadmin -m everywhere` PPD generator walks to enumerate sizes).
+        add_array_keyword(
+            attrs,
+            p,
+            "media-col-supported",
+            &[
+                "media-size",
+                "media-size-name",
+                "media-top-margin",
+                "media-bottom-margin",
+                "media-left-margin",
+                "media-right-margin",
+                "media-source",
+                "media-type",
+            ],
+        );
+        add(attrs, p, "media-col-database", IppValue::Array(media_cols.clone()));
+
+        // `media-size-supported` (PWG 5100.12 §6.3.x): `1setOf collection` of
+        // bare `media-size` (x/y only), distinct from `media-col-database`.
+        let media_sizes: Vec<IppValue> = media_kws
+            .iter()
+            .zip(cfg.media_sizes.iter().copied().chain(std::iter::repeat(default_size)))
+            .map(|(_, size)| media_size_col(size))
+            .collect();
+        add(attrs, p, "media-size-supported", IppValue::Array(media_sizes));
+
+        // media-ready / media-col-ready — the loaded media. The device backend
+        // can overwrite these per-poll with live roll data; absent that we fall
+        // back to the configured default so the (required) attributes exist.
+        add(attrs, p, "media-ready", kw(media_kws[0]));
+        add(
+            attrs,
+            p,
+            "media-col-ready",
+            IppValue::Array(vec![media_col(media_kws[0], default_size)]),
+        );
+    }
+
+    // Hard-margin support. A thermal label printer prints edge-to-edge: 0 on
+    // all sides (hundredths of a millimetre). Required by IPP Everywhere.
+    for margin in [
+        "media-top-margin-supported",
+        "media-bottom-margin-supported",
+        "media-left-margin-supported",
+        "media-right-margin-supported",
+    ] {
+        add(attrs, p, margin, IppValue::Integer(0));
     }
 
     add(
@@ -323,7 +445,108 @@ pub fn get_printer_attributes(
     );
     add(attrs, p, "print-quality-default", IppValue::Enum(4));
 
+    // --- Job/limit descriptors (PWG 5100.14 §5.x, mostly static) ---
+    add(attrs, p, "multiple-document-jobs-supported", IppValue::Boolean(false));
+    add(attrs, p, "multiple-operation-time-out", IppValue::Integer(60));
+    add(attrs, p, "multiple-operation-time-out-action", kw("process-job"));
+    add(attrs, p, "job-ids-supported", IppValue::Boolean(true));
+    add(attrs, p, "preferred-attributes-supported", IppValue::Boolean(false));
+    add_array_keyword(attrs, p, "overrides-supported", &["document-number", "pages"]);
+    add_array_keyword(attrs, p, "printer-get-attributes-supported", &["document-format"]);
+    add_array_keyword(
+        attrs,
+        p,
+        "which-jobs-supported",
+        &[
+            "completed",
+            "not-completed",
+            "aborted",
+            "canceled",
+            "pending",
+            "processing",
+        ],
+    );
+
+    // --- Rendering descriptors ---
+    add(attrs, p, "print-rendering-intent-default", kw("auto"));
+    add_array_keyword(attrs, p, "print-rendering-intent-supported", &["auto"]);
+    // One-sided printer: the back side is rendered the same way as the front.
+    add(attrs, p, "pwg-raster-document-sheet-back", kw("normal"));
+
+    // --- Identity / admin descriptors ---
+    // Location is not known to the framework; out-of-band `unknown` is the
+    // honest value (a real `geo:` URI would be fabricated coordinates).
+    add(attrs, p, "printer-geo-location", IppValue::Other { tag: 0x12, data: Vec::<u8>::new().into() });
+    add(attrs, p, "printer-organization", text(""));
+    add(attrs, p, "printer-organizational-unit", text(""));
+    add(
+        attrs,
+        p,
+        "printer-icons",
+        IppValue::Array(vec![uri(&format!(
+            "http://{}:{}/icon.png",
+            advertise_host(host),
+            port
+        ))]),
+    );
+    add(attrs, p, "pages-per-minute", IppValue::Integer(20));
+
+    // --- Supply / consumable (PWG 5100.14). The device backend can overwrite
+    // these per-poll with the real labels-remaining gauge; the static fallback
+    // keeps the required attributes present. ---
+    add(
+        attrs,
+        p,
+        "printer-supply",
+        IppValue::Array(vec![IppValue::OctetString(
+            "index=1;class=supplyThatIsConsumed;type=stoppingMaterial;\
+             unit=percent;maxcapacity=100;level=100;colorantname=unknown;"
+                .try_into()
+                .expect("supply"),
+        )]),
+    );
+    add(
+        attrs,
+        p,
+        "printer-supply-description",
+        IppValue::Array(vec![text("Label Stock")]),
+    );
+    add(
+        attrs,
+        p,
+        "printer-supply-info-uri",
+        uri(&format!("http://{}:{}/", advertise_host(host), port)),
+    );
+
+    // --- Change tracking (RFC 8011 §5.4.26-29) ---
+    let now = now_unix();
+    add(attrs, p, "printer-config-change-time", IppValue::Integer(uptime_secs() as i32));
+    add(attrs, p, "printer-config-change-date-time", datetime_utc(now));
+    add(attrs, p, "printer-state-change-time", IppValue::Integer(uptime_secs() as i32));
+    add(attrs, p, "printer-state-change-date-time", datetime_utc(now));
+
+    filter_requested(&mut resp, requested);
     Ok(resp)
+}
+
+/// Apply `requested-attributes` filtering to a freshly-built
+/// Get-Printer-Attributes response. `None` or a set containing the magic
+/// value `all` is a no-op (return everything). Otherwise the printer-attribute
+/// group is reduced to the explicitly-named attributes (RFC 8011 §4.2.5). The
+/// always-present operation attributes (charset / language) are preserved.
+fn filter_requested(resp: &mut IppRequestResponse, requested: Option<&BTreeSet<String>>) {
+    let Some(set) = requested else { return };
+    if set.is_empty() || set.contains("all") {
+        return;
+    }
+    for group in resp.attributes_mut().groups_mut() {
+        if group.tag() != DelimiterTag::PrinterAttributes {
+            continue;
+        }
+        group
+            .attributes_mut()
+            .retain(|name, _| set.contains(name.as_str()));
+    }
 }
 
 /// Validate-Job: same capability surface as Get-Printer-Attributes (success).
@@ -334,7 +557,7 @@ pub fn validate_job(
     host: &str,
     port: u16,
 ) -> Result<IppRequestResponse, ipp::parser::IppParseError> {
-    get_printer_attributes(version, request_id, record, host, port)
+    get_printer_attributes(version, request_id, record, host, port, None)
 }
 
 /// Build the `Print-Job` accepted response for a freshly-allocated job.
@@ -370,25 +593,32 @@ pub fn print_job_accepted(
     Ok(resp)
 }
 
-/// Build a `Get-Job-Attributes` response for a single job.
+/// Build a `Get-Job-Attributes` response for a single job. `requested` filters
+/// the returned attributes (`None` = all, the Get-Job-Attributes default).
 pub fn build_job_attrs_response(
     version: IppVersion,
     request_id: u32,
     job: &crate::job::JobRecord,
     printer_uri_str: &str,
+    requested: Option<&BTreeSet<String>>,
 ) -> Result<IppRequestResponse, ipp::parser::IppParseError> {
     let mut resp =
         IppRequestResponse::new_response(version, StatusCode::SuccessfulOk, request_id)?;
-    append_job_attrs(resp.attributes_mut(), job, printer_uri_str);
+    for a in job_attrs_for_group(job, printer_uri_str, requested) {
+        resp.attributes_mut().add(DelimiterTag::JobAttributes, a);
+    }
     Ok(resp)
 }
 
-/// Build a `Get-Jobs` response listing one job per group.
+/// Build a `Get-Jobs` response listing one job per group. `requested` filters
+/// the per-job attributes; the Get-Jobs default (`None`) is `job-uri` +
+/// `job-id` only (RFC 8011 §3.2.6.1), supplied by the caller.
 pub fn build_get_jobs_response(
     version: IppVersion,
     request_id: u32,
     jobs: &[crate::job::JobRecord],
     printer_uri_str: &str,
+    requested: Option<&BTreeSet<String>>,
 ) -> Result<IppRequestResponse, ipp::parser::IppParseError> {
     let mut resp =
         IppRequestResponse::new_response(version, StatusCode::SuccessfulOk, request_id)?;
@@ -397,7 +627,7 @@ pub fn build_get_jobs_response(
     // wrong for multi-job responses — we push raw groups instead.
     for job in jobs {
         let mut group = ipp::attribute::IppAttributeGroup::new(DelimiterTag::JobAttributes);
-        for a in job_attrs_for_group(job, printer_uri_str) {
+        for a in job_attrs_for_group(job, printer_uri_str, requested) {
             group
                 .attributes_mut()
                 .insert(a.name().to_owned(), a);
@@ -407,19 +637,10 @@ pub fn build_get_jobs_response(
     Ok(resp)
 }
 
-fn append_job_attrs(
-    attrs: &mut IppAttributes,
-    job: &crate::job::JobRecord,
-    printer_uri_str: &str,
-) {
-    for a in job_attrs_for_group(job, printer_uri_str) {
-        attrs.add(DelimiterTag::JobAttributes, a);
-    }
-}
-
 fn job_attrs_for_group(
     job: &crate::job::JobRecord,
     printer_uri_str: &str,
+    requested: Option<&BTreeSet<String>>,
 ) -> Vec<IppAttribute> {
     let job_uri_str = format!("{printer_uri_str}/job/{}", job.id);
     let mut out = vec![
@@ -433,6 +654,12 @@ fn job_attrs_for_group(
             ),
         ),
         attr("job-state", IppValue::Enum(job.state as i32)),
+        attr(
+            "job-originating-user-name",
+            IppValue::NameWithoutLanguage(job.owner.as_str().try_into().unwrap_or_else(|_| {
+                "anonymous".try_into().expect("anonymous")
+            })),
+        ),
         attr("time-at-creation", IppValue::Integer(job.created_secs())),
     ];
     let reason_kws = job_state_reason_keywords(job);
@@ -446,8 +673,16 @@ fn job_attrs_for_group(
             IppValue::TextWithoutLanguage(job.message.as_str().try_into().unwrap()),
         ));
     }
+    // We don't separately track when processing began; the mock pipeline
+    // starts work as soon as the job is accepted, so creation time is a faithful
+    // stand-in. Required by RFC 8011 (no-value|integer).
+    out.push(attr("time-at-processing", IppValue::Integer(job.created_secs())));
+    out.push(attr("job-printer-up-time", IppValue::Integer(uptime_secs() as i32)));
     if let Some(s) = job.completed_secs() {
         out.push(attr("time-at-completed", IppValue::Integer(s)));
+    }
+    if let Some(set) = requested {
+        out.retain(|a| set.contains(a.name().as_str()));
     }
     out
 }
@@ -510,6 +745,22 @@ fn media_col(name: &str, size_hmm: [i32; 2]) -> IppValue {
         kw(name),
     );
     IppValue::Collection(col)
+}
+
+/// Build a bare `media-size` collection (x/y dimensions only) for
+/// `media-size-supported`.
+fn media_size_col(size_hmm: [i32; 2]) -> IppValue {
+    use std::collections::BTreeMap;
+    let mut size = BTreeMap::new();
+    size.insert(
+        "x-dimension".try_into().unwrap(),
+        IppValue::Integer(size_hmm[0]),
+    );
+    size.insert(
+        "y-dimension".try_into().unwrap(),
+        IppValue::Integer(size_hmm[1]),
+    );
+    IppValue::Collection(size)
 }
 
 fn uptime_secs() -> u64 {

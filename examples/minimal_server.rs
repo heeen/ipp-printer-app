@@ -45,7 +45,7 @@ fn make_config(name: &str, driver: &str, uri: &str, device_id: &str) -> Option<P
         device_uri: uri.to_string(),
         dpi: 203,
         printhead_width_dots: 384,
-        media_names: vec!["oe_30x20mm_30x20mm".into()],
+        media_names: vec!["om_30x20mm_30x20mm".into()],
         media_sizes: vec![[3000, 2000]],
         darkness: 50,
     })

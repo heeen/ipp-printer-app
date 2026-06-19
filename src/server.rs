@@ -98,6 +98,7 @@ impl Server {
 
         Router::new()
             .route("/", get(index_handler))
+            .route("/icon.png", get(icon_handler))
             .route("/ipp/print/{name}", post(ipp_handler))
             .route("/ipp/print/{name}/", post(ipp_handler))
             .with_state(state)
@@ -233,6 +234,24 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
 }
 
+/// Serve the printer icon advertised in `printer-icons`. A 1×1 transparent
+/// PNG keeps the resource valid without shipping artwork; consumers that want
+/// a real icon can layer their own route ahead of this one.
+async fn icon_handler() -> impl IntoResponse {
+    const ICON_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/png")],
+        ICON_PNG,
+    )
+}
+
 async fn ipp_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -259,8 +278,60 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
 
     let version = req.header().version;
     let request_id = req.header().request_id;
-    let op = Operation::from_u16(req.header().operation_or_status)
-        .ok_or((StatusCode::BAD_REQUEST, "unknown IPP operation".into()))?;
+    let op_code = req.header().operation_or_status;
+
+    // RFC 8011 §4.1.8: reject IPP versions outside the 1.x / 2.x families.
+    let major = version.0 >> 8;
+    if major != 1 && major != 2 {
+        let resp = IppRequestResponse::new_response(
+            IppVersion::v1_1(),
+            IppStatus::ServerErrorVersionNotSupported,
+            request_id,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(resp.to_bytes().to_vec());
+    }
+
+    // RFC 8011 §4.1.4: the operation-attributes group must begin with
+    // `attributes-charset` followed by `attributes-natural-language`, in that
+    // order. The `ipp` crate parses attributes into a hash map (losing wire
+    // order), so we check the first two names against the raw request bytes.
+    // Wrong order / missing → `client-error-bad-request`.
+    if !operation_attributes_well_ordered(body) {
+        let resp = IppRequestResponse::new_response(
+            version,
+            IppStatus::ClientErrorBadRequest,
+            request_id,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(resp.to_bytes().to_vec());
+    }
+
+    // RFC 8011 §4.1.1: a request-id of 0 is invalid and must be rejected with
+    // `client-error-bad-request`. We answer in-band (HTTP 200 + IPP status) so
+    // conformant clients see the IPP error rather than a transport failure.
+    if request_id == 0 {
+        let resp = IppRequestResponse::new_response(
+            version,
+            IppStatus::ClientErrorBadRequest,
+            request_id,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(resp.to_bytes().to_vec());
+    }
+
+    // RFC 8011 §4.2: an operation must target the printer (or a job) via a
+    // `printer-uri` (or `job-uri`) operation attribute. We still route by the
+    // request path, but a request carrying neither is malformed.
+    if !has_operation_attr(&req, "printer-uri") && !has_operation_attr(&req, "job-uri") {
+        let resp = IppRequestResponse::new_response(
+            version,
+            IppStatus::ClientErrorBadRequest,
+            request_id,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(resp.to_bytes().to_vec());
+    }
 
     let record = {
         let guard = state.printers.read();
@@ -271,15 +342,59 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
             .ok_or((StatusCode::NOT_FOUND, format!("printer not found: {name}")))?
     };
 
+    // PWG 5100.14 required operations that the `ipp` crate's `Operation` enum
+    // doesn't model. Dispatch them by raw code before the enum conversion.
+    const OP_CANCEL_MY_JOBS: u16 = 0x0039;
+    const OP_CLOSE_JOB: u16 = 0x003b;
+    const OP_IDENTIFY_PRINTER: u16 = 0x003c;
+    match op_code {
+        OP_CLOSE_JOB => {
+            // We finalize jobs eagerly on Send-Document, so Close-Job is an
+            // acknowledgement — succeed if the job exists.
+            let status = match extract_job_id(&req).and_then(|id| state.jobs.get(id)) {
+                Some(_) => IppStatus::SuccessfulOk,
+                None => IppStatus::ClientErrorNotFound,
+            };
+            let resp = IppRequestResponse::new_response(version, status, request_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return Ok(resp.to_bytes().to_vec());
+        }
+        OP_CANCEL_MY_JOBS => {
+            for j in state.jobs.jobs_for_printer(name) {
+                state.jobs.cancel(j.id);
+            }
+            let resp =
+                IppRequestResponse::new_response(version, IppStatus::SuccessfulOk, request_id)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return Ok(resp.to_bytes().to_vec());
+        }
+        OP_IDENTIFY_PRINTER => {
+            let actions = extract_identify_actions(&req);
+            state.device_backend.identify(&record.config, &actions);
+            let resp =
+                IppRequestResponse::new_response(version, IppStatus::SuccessfulOk, request_id)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return Ok(resp.to_bytes().to_vec());
+        }
+        _ => {}
+    }
+
+    let op = Operation::from_u16(op_code)
+        .ok_or((StatusCode::BAD_REQUEST, "unknown IPP operation".into()))?;
+
     let resp = match op {
-        Operation::GetPrinterAttributes => get_printer_attributes(
-            version,
-            request_id,
-            &record,
-            &state.host,
-            state.port,
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        Operation::GetPrinterAttributes => {
+            let requested = extract_requested_attributes(&req);
+            get_printer_attributes(
+                version,
+                request_id,
+                &record,
+                &state.host,
+                state.port,
+                requested.as_ref(),
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
         Operation::ValidateJob => validate_job(version, request_id, &record, &state.host, state.port)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
         Operation::PrintJob => {
@@ -289,71 +404,75 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
                 .read_to_end(&mut payload)
                 .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-            let job = state.jobs.create(name.to_string());
+            let job = state.jobs.create(name.to_string(), requesting_user(&req));
             let printer_uri_str = record.config.printer_uri(&state.host, state.port);
             let accepted = print_job_accepted(version, request_id, &job, &printer_uri_str)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-            let state_clone = state.clone();
-            let name_owned = name.to_string();
-            let job_for_worker = job.clone();
-            std::thread::spawn(move || {
-                {
-                    let mut guard = state_clone.printers.write();
-                    if let Some(p) = guard.iter_mut().find(|p| p.config.name == name_owned) {
-                        attributes::set_printer_processing(p);
-                    }
-                }
-                state_clone
-                    .jobs
-                    .set_state(job_for_worker.id, JobState::Processing);
-                let ctx = JobContext {
-                    id: job_for_worker.id,
-                    printer_name: name_owned.clone(),
-                    cancel_flag: job_for_worker.cancel_flag.clone(),
-                };
-                let result = (state_clone.print_job)(ctx, payload, copies);
-                {
-                    let mut guard = state_clone.printers.write();
-                    if let Some(p) = guard.iter_mut().find(|p| p.config.name == name_owned) {
-                        attributes::set_printer_idle(p);
-                        match &result {
-                            Ok(()) => p.reasons = crate::flags::PrinterReason::empty(),
-                            Err(f) => p.reasons = f.printer_reasons,
-                        }
-                    }
-                }
-                match result {
-                    Ok(()) => {
-                        // Don't clobber a Cancel that landed while the worker
-                        // was running — the registry already saw it.
-                        if !job_for_worker.cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
-                            state_clone
-                                .jobs
-                                .set_state(job_for_worker.id, JobState::Completed);
-                        }
-                    }
-                    Err(f) => {
-                        log::error!(
-                            "print job {} failed: {} (reasons={:?})",
-                            job_for_worker.id,
-                            f.message,
-                            f.printer_reasons,
-                        );
-                        state_clone
-                            .jobs
-                            .set_failure(job_for_worker.id, f.printer_reasons, f.message);
-                    }
-                }
-                Server::persist(&state_clone.printers, &state_clone.state_path);
-            });
-
+            spawn_print_worker(state, name.to_string(), job, payload, copies);
             accepted
+        }
+        Operation::CreateJob => {
+            // Document-less job creation; the document arrives via Send-Document.
+            let job = state.jobs.create(name.to_string(), requesting_user(&req));
+            let printer_uri_str = record.config.printer_uri(&state.host, state.port);
+            print_job_accepted(version, request_id, &job, &printer_uri_str)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
+        Operation::SendDocument => {
+            // Attach a document to an existing (Create-Job) job and, on the
+            // last document, hand it to the print worker. We don't support
+            // multi-document jobs (multiple-document-jobs-supported = false),
+            // so each Send-Document carries the whole job.
+            // RFC 8011 §3.3.1: Send-Document requires the `last-document`
+            // boolean operation attribute.
+            if !has_operation_attr(&req, "last-document") {
+                let resp = IppRequestResponse::new_response(
+                    version,
+                    IppStatus::ClientErrorBadRequest,
+                    request_id,
+                )
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                return Ok(resp.to_bytes().to_vec());
+            }
+            let job_id = extract_job_id(&req).ok_or((
+                StatusCode::BAD_REQUEST,
+                "Send-Document missing job-id".to_string(),
+            ))?;
+            let job = state.jobs.get(job_id).ok_or((
+                StatusCode::NOT_FOUND,
+                format!("job not found: {job_id}"),
+            ))?;
+            let copies = extract_copies(&req);
+            let mut payload = Vec::new();
+            req.payload_mut()
+                .read_to_end(&mut payload)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+            if !payload.is_empty() {
+                spawn_print_worker(state, name.to_string(), job.clone(), payload, copies);
+            }
+            let printer_uri_str = record.config.printer_uri(&state.host, state.port);
+            build_job_attrs_response(version, request_id, &job, &printer_uri_str, None)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         }
         Operation::GetJobs => {
             let printer_uri_str = record.config.printer_uri(&state.host, state.port);
-            let jobs = state.jobs.jobs_for_printer(name);
-            build_get_jobs_response(version, request_id, &jobs, &printer_uri_str)
+            let mut jobs = state.jobs.jobs_for_printer(name);
+            // RFC 8011 §3.2.6.1: `my-jobs=true` scopes the listing to the
+            // requesting user's own jobs.
+            if my_jobs_flag(&req) {
+                let user = requesting_user(&req);
+                jobs.retain(|j| j.owner == user);
+            }
+            // When the client omits `requested-attributes`, Get-Jobs returns
+            // only `job-uri` and `job-id`.
+            let requested = extract_requested_attributes(&req);
+            let default_set = ["job-uri".to_string(), "job-id".to_string()]
+                .into_iter()
+                .collect();
+            let filter = effective_filter(requested.as_ref(), &default_set);
+            build_get_jobs_response(version, request_id, &jobs, &printer_uri_str, filter)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         }
         Operation::GetJobAttributes => {
@@ -366,7 +485,12 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
                 StatusCode::NOT_FOUND,
                 format!("job not found: {job_id}"),
             ))?;
-            build_job_attrs_response(version, request_id, &job, &printer_uri_str)
+            // Get-Job-Attributes default is "all" — filter only when the
+            // client supplies a concrete `requested-attributes` set.
+            let requested = extract_requested_attributes(&req);
+            let all = std::collections::BTreeSet::new();
+            let filter = effective_filter(requested.as_ref(), &all);
+            build_job_attrs_response(version, request_id, &job, &printer_uri_str, filter)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         }
         Operation::CancelJob => {
@@ -391,6 +515,57 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
     };
 
     Ok(resp.to_bytes().to_vec())
+}
+
+/// RFC 8011 §4.1.4: the operation-attributes group must start with
+/// `attributes-charset` then `attributes-natural-language`, in that order.
+/// Parses the first two attribute *names* directly from the raw IPP request
+/// (header is 8 bytes; the operation group is the first delimiter group) and
+/// checks them. Returns `false` on a short/malformed buffer.
+fn operation_attributes_well_ordered(body: &[u8]) -> bool {
+    // header: version(2) operation(2) request-id(4), then delimiter tag.
+    if body.len() <= 8 || body[8] != ipp::model::DelimiterTag::OperationAttributes as u8 {
+        return false;
+    }
+    let mut i = 9;
+    let mut names: Vec<&[u8]> = Vec::new();
+    while i < body.len() && names.len() < 2 {
+        let tag = body[i];
+        if tag <= 0x0f {
+            break; // next delimiter tag → end of operation group
+        }
+        i += 1;
+        if i + 2 > body.len() {
+            return false;
+        }
+        let name_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2;
+        if i + name_len > body.len() {
+            return false;
+        }
+        // name_len == 0 marks an additional value of the previous attribute.
+        if name_len > 0 {
+            names.push(&body[i..i + name_len]);
+        }
+        i += name_len;
+        if i + 2 > body.len() {
+            return false;
+        }
+        let value_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2 + value_len;
+    }
+    names.first() == Some(&b"attributes-charset".as_slice())
+        && names.get(1) == Some(&b"attributes-natural-language".as_slice())
+}
+
+/// True if an attribute named `name` is present in the operation-attributes
+/// group of `req`.
+fn has_operation_attr(req: &IppRequestResponse, name: &str) -> bool {
+    req.attributes()
+        .groups()
+        .iter()
+        .filter(|g| g.tag() == ipp::model::DelimiterTag::OperationAttributes)
+        .any(|g| g.attributes().keys().any(|k| k.as_str() == name))
 }
 
 fn extract_job_id(req: &IppRequestResponse) -> Option<JobId> {
@@ -422,4 +597,150 @@ fn extract_copies(req: &IppRequestResponse) -> u32 {
         }
     }
     0
+}
+
+/// Collect the client's `requested-attributes` values (RFC 8011 §4.2.5).
+/// Returns `None` when the attribute is absent (caller treats that as "all").
+fn extract_requested_attributes(req: &IppRequestResponse) -> Option<std::collections::BTreeSet<String>> {
+    for group in req.attributes().groups() {
+        for attr in group.attributes().values() {
+            if attr.name().as_str() == "requested-attributes" {
+                let mut set = std::collections::BTreeSet::new();
+                for v in attr.value().into_iter() {
+                    if let IppValue::Keyword(k) = v {
+                        set.insert(k.as_str().to_string());
+                    }
+                }
+                return Some(set);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the effective attribute filter for a job query. `requested` is the
+/// client's `requested-attributes` (if any); `default` is the operation's
+/// default set (empty = "all"). Returns `None` to mean "return everything".
+fn effective_filter<'a>(
+    requested: Option<&'a std::collections::BTreeSet<String>>,
+    default: &'a std::collections::BTreeSet<String>,
+) -> Option<&'a std::collections::BTreeSet<String>> {
+    match requested {
+        None => (!default.is_empty()).then_some(default),
+        Some(set) if set.is_empty() || set.contains("all") => None,
+        Some(set) => Some(set),
+    }
+}
+
+/// Read `requesting-user-name` from the operation attributes, defaulting to
+/// `anonymous` when the client omits it.
+fn requesting_user(req: &IppRequestResponse) -> String {
+    for group in req.attributes().groups() {
+        for attr in group.attributes().values() {
+            if attr.name().as_str() == "requesting-user-name" {
+                if let IppValue::NameWithoutLanguage(s) = attr.value() {
+                    return s.as_str().to_string();
+                }
+            }
+        }
+    }
+    "anonymous".to_string()
+}
+
+/// Read the `my-jobs` boolean operation attribute (default `false`).
+fn my_jobs_flag(req: &IppRequestResponse) -> bool {
+    for group in req.attributes().groups() {
+        for attr in group.attributes().values() {
+            if attr.name().as_str() == "my-jobs" {
+                if let IppValue::Boolean(b) = attr.value() {
+                    return *b;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Collect `identify-actions` keywords from an Identify-Printer request.
+fn extract_identify_actions(req: &IppRequestResponse) -> Vec<String> {
+    for group in req.attributes().groups() {
+        for attr in group.attributes().values() {
+            if attr.name().as_str() == "identify-actions" {
+                return attr
+                    .value()
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        IppValue::Keyword(k) => Some(k.as_str().to_string()),
+                        _ => None,
+                    })
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Spawn the background worker that runs a print job to completion, updating
+/// printer/job state and persisting at the end. Shared by Print-Job and
+/// Send-Document.
+fn spawn_print_worker(
+    state: &AppState,
+    printer_name: String,
+    job: crate::job::JobRecord,
+    payload: Vec<u8>,
+    copies: u32,
+) {
+    let state_clone = state.clone();
+    let name_owned = printer_name;
+    let job_for_worker = job;
+    std::thread::spawn(move || {
+        {
+            let mut guard = state_clone.printers.write();
+            if let Some(p) = guard.iter_mut().find(|p| p.config.name == name_owned) {
+                attributes::set_printer_processing(p);
+            }
+        }
+        state_clone
+            .jobs
+            .set_state(job_for_worker.id, JobState::Processing);
+        let ctx = JobContext {
+            id: job_for_worker.id,
+            printer_name: name_owned.clone(),
+            cancel_flag: job_for_worker.cancel_flag.clone(),
+        };
+        let result = (state_clone.print_job)(ctx, payload, copies);
+        {
+            let mut guard = state_clone.printers.write();
+            if let Some(p) = guard.iter_mut().find(|p| p.config.name == name_owned) {
+                attributes::set_printer_idle(p);
+                match &result {
+                    Ok(()) => p.reasons = crate::flags::PrinterReason::empty(),
+                    Err(f) => p.reasons = f.printer_reasons,
+                }
+            }
+        }
+        match result {
+            Ok(()) => {
+                // Don't clobber a Cancel that landed while the worker was
+                // running — the registry already saw it.
+                if !job_for_worker.cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    state_clone
+                        .jobs
+                        .set_state(job_for_worker.id, JobState::Completed);
+                }
+            }
+            Err(f) => {
+                log::error!(
+                    "print job {} failed: {} (reasons={:?})",
+                    job_for_worker.id,
+                    f.message,
+                    f.printer_reasons,
+                );
+                state_clone
+                    .jobs
+                    .set_failure(job_for_worker.id, f.printer_reasons, f.message);
+            }
+        }
+        Server::persist(&state_clone.printers, &state_clone.state_path);
+    });
 }
