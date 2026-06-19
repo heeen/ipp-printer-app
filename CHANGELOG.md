@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.0 — 2026-06-20
+
+Surface the request's document format to the print callback and make the
+advertised formats configurable — the groundwork for a consumer to accept
+`image/jpeg` (IPP Everywhere's last required format) by decoding it in its own
+backend.
+
+### Breaking changes
+
+- **`JobContext` gains `document_format: String`** — the `document-format` the
+  client sent (default `application/octet-stream`). The print callback branches
+  on it to pick a decoder. Only the framework constructs `JobContext`, so
+  consumers that merely read it are unaffected.
+- **`PrinterConfig` gains `document_formats: Vec<String>`** (`#[serde(default)]`,
+  so old persisted state loads). When non-empty it drives
+  `document-format-supported`; empty keeps the raster defaults
+  (`image/pwg-raster`, `application/vnd.cups-raster`, `application/octet-stream`).
+  `document-format-default` stays `image/pwg-raster`.
+
 ## 0.5.0 — 2026-06-19
 
 Device-fed dynamic media & supply (IPP Everywhere Tier 4). Backends can now

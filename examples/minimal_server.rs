@@ -48,6 +48,7 @@ fn make_config(name: &str, driver: &str, uri: &str, device_id: &str) -> Option<P
         media_names: vec!["om_30x20mm_30x20mm".into()],
         media_sizes: vec![[3000, 2000]],
         darkness: 50,
+        document_formats: Vec::new(),
     })
 }
 

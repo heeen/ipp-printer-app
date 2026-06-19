@@ -246,16 +246,23 @@ pub fn get_printer_attributes(
     add_array_keyword(attrs, p, "compression-supported", &["none"]);
 
     // PWG raster is the IPP Everywhere required format; the unified CUPS reader
-    // also handles legacy CUPS raster v1/v2 if a client picks that path.
+    // also handles legacy CUPS raster v1/v2 if a client picks that path. The
+    // consumer may extend this via `PrinterConfig::document_formats` (e.g. to
+    // advertise `image/jpeg` once its backend decodes it).
+    let format_values: Vec<IppValue> = if cfg.document_formats.is_empty() {
+        vec![
+            mime("image/pwg-raster"),
+            mime("application/vnd.cups-raster"),
+            mime("application/octet-stream"),
+        ]
+    } else {
+        cfg.document_formats.iter().map(|f| mime(f)).collect()
+    };
     add(
         attrs,
         p,
         "document-format-supported",
-        IppValue::Array(vec![
-            mime("image/pwg-raster"),
-            mime("application/vnd.cups-raster"),
-            mime("application/octet-stream"),
-        ]),
+        IppValue::Array(format_values),
     );
     add(
         attrs,

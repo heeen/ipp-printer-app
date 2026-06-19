@@ -23,6 +23,13 @@ pub struct PrinterConfig {
     pub media_sizes: Vec<[i32; 2]>,
     /// Darkness 0–100 (maps to print density).
     pub darkness: i32,
+    /// MIME types the consumer's print callback can decode, emitted as
+    /// `document-format-supported`. Empty falls back to the framework's raster
+    /// defaults (`image/pwg-raster`, `application/vnd.cups-raster`,
+    /// `application/octet-stream`). Add `image/jpeg` etc. when the backend can
+    /// handle them.
+    #[serde(default)]
+    pub document_formats: Vec<String>,
 }
 
 impl PrinterConfig {
@@ -109,3 +116,22 @@ impl<'a> PrinterHandle<'a> {
 
 /// Shared printer registry. Cheap to clone (it's an `Arc`).
 pub type PrinterRegistry = Arc<RwLock<Vec<PrinterRecord>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A persisted config written before `document_formats` existed must still
+    /// deserialize (the field is `#[serde(default)]` → empty).
+    #[test]
+    fn config_without_document_formats_loads() {
+        let json = r#"{
+            "name": "p", "driver_name": "d", "make_and_model": "m",
+            "device_id": "", "device_uri": "mock://x", "dpi": 203,
+            "printhead_width_dots": 384, "media_names": [], "media_sizes": [],
+            "darkness": 50
+        }"#;
+        let cfg: PrinterConfig = serde_json::from_str(json).expect("back-compat load");
+        assert!(cfg.document_formats.is_empty());
+    }
+}

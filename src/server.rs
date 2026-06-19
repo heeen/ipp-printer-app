@@ -33,6 +33,11 @@ pub struct JobContext {
     pub id: JobId,
     pub printer_name: String,
     pub cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The `document-format` the client sent (RFC 8011), e.g.
+    /// `image/pwg-raster` or `image/jpeg`. Defaults to
+    /// `application/octet-stream` when the client omits it. The print
+    /// callback branches on this to pick a decoder.
+    pub document_format: String,
 }
 
 /// Callback to process a CUPS raster document on a device.
@@ -399,6 +404,7 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
         Operation::PrintJob => {
             let copies = extract_copies(&req);
+            let format = extract_document_format(&req);
             let mut payload = Vec::new();
             req.payload_mut()
                 .read_to_end(&mut payload)
@@ -409,7 +415,7 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
             let accepted = print_job_accepted(version, request_id, &job, &printer_uri_str)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-            spawn_print_worker(state, name.to_string(), job, payload, copies);
+            spawn_print_worker(state, name.to_string(), job, payload, copies, format);
             accepted
         }
         Operation::CreateJob => {
@@ -444,13 +450,14 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
                 format!("job not found: {job_id}"),
             ))?;
             let copies = extract_copies(&req);
+            let format = extract_document_format(&req);
             let mut payload = Vec::new();
             req.payload_mut()
                 .read_to_end(&mut payload)
                 .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
             if !payload.is_empty() {
-                spawn_print_worker(state, name.to_string(), job.clone(), payload, copies);
+                spawn_print_worker(state, name.to_string(), job.clone(), payload, copies, format);
             }
             let printer_uri_str = record.config.printer_uri(&state.host, state.port);
             build_job_attrs_response(version, request_id, &job, &printer_uri_str, None)
@@ -599,6 +606,21 @@ fn extract_copies(req: &IppRequestResponse) -> u32 {
     0
 }
 
+/// Read the `document-format` operation attribute. Defaults to
+/// `application/octet-stream` (the IPP default) when the client omits it.
+fn extract_document_format(req: &IppRequestResponse) -> String {
+    for group in req.attributes().groups() {
+        for attr in group.attributes().values() {
+            if attr.name().as_str() == "document-format" {
+                if let IppValue::MimeMediaType(s) = attr.value() {
+                    return s.as_str().to_string();
+                }
+            }
+        }
+    }
+    "application/octet-stream".to_string()
+}
+
 /// Collect the client's `requested-attributes` values (RFC 8011 §4.2.5).
 /// Returns `None` when the attribute is absent (caller treats that as "all").
 fn extract_requested_attributes(req: &IppRequestResponse) -> Option<std::collections::BTreeSet<String>> {
@@ -689,6 +711,7 @@ fn spawn_print_worker(
     job: crate::job::JobRecord,
     payload: Vec<u8>,
     copies: u32,
+    document_format: String,
 ) {
     let state_clone = state.clone();
     let name_owned = printer_name;
@@ -707,6 +730,7 @@ fn spawn_print_worker(
             id: job_for_worker.id,
             printer_name: name_owned.clone(),
             cancel_flag: job_for_worker.cancel_flag.clone(),
+            document_format,
         };
         let result = (state_clone.print_job)(ctx, payload, copies);
         {
