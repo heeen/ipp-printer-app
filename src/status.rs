@@ -55,18 +55,25 @@ async fn poll_once(backend: &dyn DeviceBackend, registry: &PrinterRegistry) {
     for cfg in configs {
         // `poll_status` may block on a HID read; let it run in the blocking
         // section so other tasks (Get-Printer-Attributes, etc.) stay responsive.
-        let reasons = tokio::task::block_in_place(|| backend.poll_status(&cfg));
-        if let Some(reasons) = reasons {
+        let status = tokio::task::block_in_place(|| backend.poll_status(&cfg));
+        if let Some(status) = status {
             let mut g = registry.write();
             if let Some(rec) = g.iter_mut().find(|r| r.config.name == cfg.name) {
-                if rec.reasons != reasons {
+                if rec.reasons != status.reasons {
                     log::debug!(
                         "status: {} reasons {:?} -> {:?}",
                         cfg.name,
                         rec.reasons,
-                        reasons
+                        status.reasons
                     );
-                    rec.reasons = reasons;
+                    rec.reasons = status.reasons;
+                }
+                // Carry forward last-known media/supply when a poll omits them.
+                if status.ready_media.is_some() {
+                    rec.ready_media = status.ready_media;
+                }
+                if status.supply_percent.is_some() {
+                    rec.supply_percent = status.supply_percent;
                 }
             }
         }

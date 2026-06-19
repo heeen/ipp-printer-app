@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0 — 2026-06-19
+
+Device-fed dynamic media & supply (IPP Everywhere Tier 4). Backends can now
+publish the *currently loaded* media and remaining-supply level each poll, so
+`media-ready` / `media-col-ready` / `printer-supply` reflect the real device
+instead of the static config fallback.
+
+### Breaking changes
+
+- **`DeviceBackend::poll_status` now returns `Option<PollStatus>`** instead of
+  `Option<PrinterReason>`. `PollStatus { reasons, ready_media, supply_percent }`
+  carries the reasons plus the optional dynamic fields. Migrate a reasons-only
+  backend with `PollStatus::from_reasons(reasons)`.
+
+### New
+
+- **`PollStatus`** and **`ReadyMedia { name, size_hmm, media_type }`** exported
+  from the crate root.
+- **`PrinterRecord` gains `ready_media: Option<ReadyMedia>` and
+  `supply_percent: Option<u8>`**, written by the status loop (last-known value
+  is carried forward when a poll omits them).
+- `media-ready` / `media-col-ready` use the live `ready_media` when present;
+  `printer-supply` reports the live `supply_percent` (0–100), else full.
+
 ## 0.4.0 — 2026-06-19
 
 IPP Everywhere conformance pass. Validated against the canonical

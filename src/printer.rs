@@ -57,6 +57,13 @@ pub struct PrinterRecord {
     pub state: IppPrinterState,
     pub reasons: PrinterReason,
     pub uuid: String,
+    /// Live media loaded in the device, set by the status poller. `None` until
+    /// the first successful poll — the attribute builder then falls back to the
+    /// configured default for `media-ready` / `media-col-ready`.
+    pub ready_media: Option<crate::device::ReadyMedia>,
+    /// Live remaining-supply level 0–100 from the status poller. `None` falls
+    /// back to a full static `printer-supply`.
+    pub supply_percent: Option<u8>,
 }
 
 impl PrinterRecord {
@@ -66,6 +73,8 @@ impl PrinterRecord {
             uuid: uuid::Uuid::new_v4().to_string(),
             state: IppPrinterState::Idle,
             reasons: PrinterReason::empty(),
+            ready_media: None,
+            supply_percent: None,
             config,
         }
     }

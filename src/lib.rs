@@ -27,7 +27,7 @@ pub mod server;
 pub mod state;
 pub mod status;
 
-pub use device::DeviceBackend;
+pub use device::{DeviceBackend, PollStatus, ReadyMedia};
 pub use flags::PrinterReason;
 pub use job::{JobId, JobRecord, JobRegistry, JobState};
 pub use printer::{PrinterConfig, PrinterHandle, PrinterRecord, PrinterRegistry};

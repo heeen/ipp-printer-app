@@ -403,15 +403,19 @@ pub fn get_printer_attributes(
             .collect();
         add(attrs, p, "media-size-supported", IppValue::Array(media_sizes));
 
-        // media-ready / media-col-ready — the loaded media. The device backend
-        // can overwrite these per-poll with live roll data; absent that we fall
+        // media-ready / media-col-ready — the loaded media. The status poller
+        // fills `record.ready_media` with live roll data; absent that we fall
         // back to the configured default so the (required) attributes exist.
-        add(attrs, p, "media-ready", kw(media_kws[0]));
+        let (ready_name, ready_size) = match &record.ready_media {
+            Some(rm) => (rm.name.as_str(), rm.size_hmm),
+            None => (media_kws[0], default_size),
+        };
+        add(attrs, p, "media-ready", kw(ready_name));
         add(
             attrs,
             p,
             "media-col-ready",
-            IppValue::Array(vec![media_col(media_kws[0], default_size)]),
+            IppValue::Array(vec![media_col(ready_name, ready_size)]),
         );
     }
 
@@ -494,15 +498,19 @@ pub fn get_printer_attributes(
     // --- Supply / consumable (PWG 5100.14). The device backend can overwrite
     // these per-poll with the real labels-remaining gauge; the static fallback
     // keeps the required attributes present. ---
+    // Live remaining-supply level from the poller, else assume full.
+    let supply_level = record.supply_percent.unwrap_or(100);
     add(
         attrs,
         p,
         "printer-supply",
         IppValue::Array(vec![IppValue::OctetString(
-            "index=1;class=supplyThatIsConsumed;type=stoppingMaterial;\
-             unit=percent;maxcapacity=100;level=100;colorantname=unknown;"
-                .try_into()
-                .expect("supply"),
+            format!(
+                "index=1;class=supplyThatIsConsumed;type=stoppingMaterial;\
+                 unit=percent;maxcapacity=100;level={supply_level};colorantname=unknown;"
+            )
+            .try_into()
+            .expect("supply"),
         )]),
     );
     add(
