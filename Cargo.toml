@@ -1,6 +1,6 @@
 [package]
 name = "ipp-printer-app"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 license = "MIT"
 authors = ["Florian Hänel <heeen.de@gmail.com>"]
@@ -14,7 +14,7 @@ categories = ["network-programming", "web-programming::http-server", "hardware-s
 
 [features]
 default = ["mdns"]
-mdns = ["dep:mdns-sd"]
+mdns = ["dep:mdns-sd", "dep:if-addrs"]
 
 [dependencies]
 ipp = { version = "6", default-features = false }
@@ -34,6 +34,7 @@ parking_lot = "0.12"
 futures = "0.3"
 num-traits = "0.2"
 mdns-sd = { version = "0.19", optional = true }
+if-addrs = { version = "0.15", optional = true }
 
 [dev-dependencies]
 ipp = { version = "6", default-features = false }

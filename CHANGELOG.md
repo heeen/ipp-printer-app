@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.1 — 2026-06-22
+
+Restrict mDNS advertising to real interfaces. `enable_addr_auto()` published the
+service on *every* host interface, including Docker `veth*`/`br-*` links. A
+co-resident `cups-browsed` then resolved us over those links, and the racy /
+duplicate A-record answers made avahi hand it a *null* host name for some
+resolves — which fails its `is_local_hostname()` check, bypasses the `UUID=`
+dedup, and makes it build a spurious `implicitclass://` duplicate queue. The
+advertiser now enumerates interfaces and skips loopback, link-local, down, and
+container/VM virtual bridges (`veth`, `docker`, `br-`, `virbr`, `vnet`, `vmnet`,
+`vboxnet`), advertising an explicit address list instead. Falls back to the old
+auto-detection if enumeration fails or filters everything out. No API change.
+
 ## 0.6.0 — 2026-06-20
 
 Surface the request's document format to the print callback and make the
