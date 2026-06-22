@@ -2,6 +2,7 @@
 
 use std::io::{Cursor, Read};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -22,7 +23,7 @@ use crate::attributes::{
 use crate::device::DeviceBackend;
 use crate::job::{JobId, JobRegistry, JobState};
 use crate::printer::{PrinterRecord, PrinterRegistry};
-use crate::raster::JobFailure;
+use crate::raster::JobOutcome;
 use crate::state::PersistedState;
 
 /// Context passed to a print-job worker so it can observe cancellation and
@@ -40,15 +41,25 @@ pub struct JobContext {
     pub document_format: String,
 }
 
-/// Callback to process a CUPS raster document on a device.
+impl JobContext {
+    /// True once the client has canceled this job. A print callback that loops
+    /// (e.g. waiting on hardware) should poll this and bail promptly.
+    pub fn is_canceled(&self) -> bool {
+        self.cancel_flag.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Callback that prints one document to the device, returning a [`JobOutcome`]
+/// that tells the framework what to do with the job.
 ///
-/// Returning `Err(JobFailure)` lets the framework propagate
-/// `job-state-reasons` / `job-state-message` to IPP clients.
-pub type PrintJobFn = Arc<
-    dyn Fn(JobContext, Vec<u8>, u32) -> Result<(), JobFailure>
-        + Send
-        + Sync,
->;
+/// It receives the payload by reference because the framework may call it more
+/// than once: returning [`JobOutcome::DeviceUnavailable`] makes the framework
+/// hold the job and re-invoke this callback (with backoff) until it prints or
+/// the client cancels — so classify a transient device condition as
+/// `DeviceUnavailable`, not `Failed`. Do any cheap reachability check (opening
+/// the device) *first* so a held retry is cheap. The callback should also bail
+/// early if [`JobContext::is_canceled`] becomes true.
+pub type PrintJobFn = Arc<dyn Fn(JobContext, &[u8], u32) -> crate::raster::JobOutcome + Send + Sync>;
 
 /// Server configuration. Construct in your `main`, hand to [`Server::run`].
 #[allow(missing_docs)]
@@ -117,15 +128,14 @@ impl Server {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         log::info!("ipp-printer-app listening on http://{addr}");
 
-        // Background status poller — keeps printer-state-reasons fresh.
-        let _status = crate::status::spawn(opts.device_backend.clone(), opts.printers.clone());
-
         // mDNS advertising for IPP-Everywhere auto-discovery. Skipped when the
         // caller opts to advertise itself later (see ServerOptions::advertise_mdns).
+        // Created before the poller so the poller can withdraw/republish each
+        // printer's advert as its device goes offline / comes back online.
         #[cfg(feature = "mdns")]
-        let _advertiser = if opts.advertise_mdns {
+        let advertiser: Option<Arc<dyn crate::status::AdvertiserControl>> = if opts.advertise_mdns {
             match crate::mdns::Advertiser::register_all(&opts.printers, opts.port) {
-                Ok(adv) => Some(adv),
+                Ok(adv) => Some(Arc::new(adv)),
                 Err(e) => {
                     log::warn!("mdns: failed to register printers: {e}");
                     None
@@ -134,6 +144,18 @@ impl Server {
         } else {
             None
         };
+        #[cfg(not(feature = "mdns"))]
+        let advertiser: Option<Arc<dyn crate::status::AdvertiserControl>> = None;
+
+        // Background status poller — refreshes printer-state-reasons and drives
+        // the advertiser on offline/online transitions.
+        let _status = crate::status::spawn(
+            opts.device_backend.clone(),
+            opts.printers.clone(),
+            advertiser.clone(),
+        );
+        // Hold the advertiser for the server's lifetime (Drop withdraws all).
+        let _advertiser = advertiser;
 
         axum::serve(listener, Self::router(opts)).await
     }
@@ -143,7 +165,7 @@ impl Server {
         registry: &PrinterRegistry,
         backend: &dyn DeviceBackend,
         state_path: &std::path::Path,
-        make_config: impl Fn(&str, &str, &str, &str) -> Option<crate::printer::PrinterConfig>,
+        make_config: impl Fn(&str, &str, &str, &str, &str) -> Option<crate::printer::PrinterConfig>,
     ) {
         let mut records: Vec<PrinterRecord> = PersistedState::load(state_path)
             .printers
@@ -160,7 +182,7 @@ impl Server {
             if records.iter().any(|r| r.config.device_uri == uri) {
                 return true;
             }
-            let Some(cfg) = make_config(&name, &driver, uri, device_id) else {
+            let Some(cfg) = make_config(&name, info, &driver, uri, device_id) else {
                 return true;
             };
             log::info!("auto-add printer {name} -> {uri}");
@@ -185,9 +207,13 @@ impl Server {
     }
 }
 
-/// Generic slug used as the proposed printer name during bootstrap. The
-/// `make_config` callback receives this as its first arg and is free to
-/// override by returning a [`PrinterConfig`] with a different `name`.
+/// Logical queue name proposed during bootstrap. Lowercases and maps every
+/// non-alphanumeric run to a single `_`, mirroring CUPS's own DNS-SD
+/// queue-name sanitiser (`cups_queue_name`) so that — given a case-insensitive
+/// CUPS name lookup — our persistent queue matches the on-demand temp queue
+/// CUPS would derive from the (spaced) DNS-SD instance name, and no duplicate
+/// is created. The `make_config` callback receives this as its `name` arg and
+/// may override by returning a [`PrinterConfig`] with a different `name`.
 fn printer_name_from_uri(uri: &str, info: &str) -> String {
     let source = if info.is_empty() { uri } else { info };
     let slug: String = source
@@ -196,16 +222,16 @@ fn printer_name_from_uri(uri: &str, info: &str) -> String {
             if c.is_ascii_alphanumeric() {
                 c.to_ascii_lowercase()
             } else {
-                '-'
+                '_'
             }
         })
         .collect();
-    let trimmed = slug.trim_matches('-');
+    let trimmed = slug.trim_matches('_');
     let collapsed: String = trimmed
-        .split('-')
+        .split('_')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join("-");
+        .join("_");
     if collapsed.is_empty() {
         "printer".to_string()
     } else {
@@ -222,8 +248,10 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     for p in printers.iter() {
         let uri = p.config.printer_uri(&state.host, state.port);
         html.push_str(&format!(
-            "<li><b>{}</b> — <code>{uri}</code> — device <code>{}</code></li>",
-            p.config.name, p.config.device_uri
+            "<li><b>{}</b> (<code>{}</code>) — <code>{uri}</code> — device <code>{}</code></li>",
+            p.config.display_label(),
+            p.config.name,
+            p.config.device_uri
         ));
     }
     html.push_str(&format!(
@@ -717,6 +745,10 @@ fn spawn_print_worker(
     let name_owned = printer_name;
     let job_for_worker = job;
     std::thread::spawn(move || {
+        // The printer stays `Processing` for the whole life of the job —
+        // including while held waiting for the device. That keeps the status
+        // poller (which only touches Idle/Stopped printers) off the device so
+        // it can't contend with our retries.
         {
             let mut guard = state_clone.printers.write();
             if let Some(p) = guard.iter_mut().find(|p| p.config.name == name_owned) {
@@ -732,39 +764,256 @@ fn spawn_print_worker(
             cancel_flag: job_for_worker.cancel_flag.clone(),
             document_format,
         };
-        let result = (state_clone.print_job)(ctx, payload, copies);
-        {
-            let mut guard = state_clone.printers.write();
-            if let Some(p) = guard.iter_mut().find(|p| p.config.name == name_owned) {
-                attributes::set_printer_idle(p);
-                match &result {
-                    Ok(()) => p.reasons = crate::flags::PrinterReason::empty(),
-                    Err(f) => p.reasons = f.printer_reasons,
+
+        // Retry/hold loop. A `DeviceUnavailable` outcome holds the job
+        // (`processing-stopped`) and retries with capped backoff until the
+        // device prints it, the job is canceled, or it hits a hard failure —
+        // the printer-application equivalent of holding a job through a jam.
+        const BACKOFF_MAX: Duration = Duration::from_secs(30);
+        // Initial retry backoff; doubles up to BACKOFF_MAX. Override for tests
+        // / tuning with IPP_PRINTER_APP_RETRY_MS.
+        let backoff_start = std::env::var("IPP_PRINTER_APP_RETRY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(2));
+        let mut backoff = backoff_start.min(BACKOFF_MAX);
+        let mut held = false;
+        loop {
+            if ctx.is_canceled() {
+                break;
+            }
+            match (state_clone.print_job)(ctx.clone(), &payload, copies) {
+                JobOutcome::Completed => {
+                    set_printer_reasons(&state_clone, &name_owned, crate::flags::PrinterReason::empty());
+                    set_printer_idle_named(&state_clone, &name_owned);
+                    // Don't clobber a Cancel that landed mid-print.
+                    if !ctx.is_canceled() {
+                        state_clone.jobs.set_state(job_for_worker.id, JobState::Completed);
+                    }
+                    break;
+                }
+                JobOutcome::Failed(f) => {
+                    log::error!(
+                        "print job {} failed: {} (reasons={:?})",
+                        job_for_worker.id, f.message, f.printer_reasons
+                    );
+                    set_printer_reasons(&state_clone, &name_owned, f.printer_reasons);
+                    set_printer_idle_named(&state_clone, &name_owned);
+                    state_clone.jobs.set_failure(job_for_worker.id, f.printer_reasons, f.message);
+                    break;
+                }
+                JobOutcome::DeviceUnavailable { reasons } => {
+                    if !held {
+                        held = true;
+                        log::info!(
+                            "print job {} held: device unavailable (reasons={:?}); will retry until it prints or is canceled",
+                            job_for_worker.id, reasons
+                        );
+                    }
+                    // Surface the condition but keep printer-state Processing.
+                    set_printer_reasons(&state_clone, &name_owned, reasons);
+                    state_clone.jobs.set_state(job_for_worker.id, JobState::ProcessingStopped);
+                    if sleep_cancelable(&ctx.cancel_flag, backoff) {
+                        break; // canceled during the wait
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
                 }
             }
         }
-        match result {
-            Ok(()) => {
-                // Don't clobber a Cancel that landed while the worker was
-                // running — the registry already saw it.
-                if !job_for_worker.cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
-                    state_clone
-                        .jobs
-                        .set_state(job_for_worker.id, JobState::Completed);
-                }
-            }
-            Err(f) => {
-                log::error!(
-                    "print job {} failed: {} (reasons={:?})",
-                    job_for_worker.id,
-                    f.message,
-                    f.printer_reasons,
-                );
-                state_clone
-                    .jobs
-                    .set_failure(job_for_worker.id, f.printer_reasons, f.message);
-            }
+
+        if ctx.is_canceled() {
+            // Reflect the cancel and clear any held condition.
+            set_printer_reasons(&state_clone, &name_owned, crate::flags::PrinterReason::empty());
+            set_printer_idle_named(&state_clone, &name_owned);
+            state_clone.jobs.cancel(job_for_worker.id);
         }
         Server::persist(&state_clone.printers, &state_clone.state_path);
     });
+}
+
+/// Set `printer-state-reasons` for the named printer.
+fn set_printer_reasons(state: &AppState, name: &str, reasons: crate::flags::PrinterReason) {
+    let mut guard = state.printers.write();
+    if let Some(p) = guard.iter_mut().find(|p| p.config.name == name) {
+        p.reasons = reasons;
+    }
+}
+
+/// Return the named printer to `idle`.
+fn set_printer_idle_named(state: &AppState, name: &str) {
+    let mut guard = state.printers.write();
+    if let Some(p) = guard.iter_mut().find(|p| p.config.name == name) {
+        attributes::set_printer_idle(p);
+    }
+}
+
+/// Sleep up to `dur`, waking early (and returning `true`) if the cancel flag is
+/// set. Polls in short slices so a Cancel-Job is honored promptly.
+fn sleep_cancelable(cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>, dur: Duration) -> bool {
+    const SLICE: Duration = Duration::from_millis(250);
+    let mut left = dur;
+    while left > Duration::ZERO {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        let nap = left.min(SLICE);
+        std::thread::sleep(nap);
+        left -= nap;
+    }
+    cancel.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::DeviceBackend;
+    use crate::flags::PrinterReason;
+    use crate::job::JobState;
+    use crate::printer::{PrinterConfig, PrinterRecord, PrinterRegistry};
+    use crate::raster::{JobFailure, JobOutcome};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The logical slug must match what CUPS's `cups_queue_name` derives from
+    /// the same (spaced, mixed-case) DNS-SD instance name, modulo case — CUPS's
+    /// printer lookup is case-insensitive. CUPS maps each non-alnum run to one
+    /// `_` and trims; we additionally lowercase.
+    #[test]
+    fn slug_matches_cups_queue_name_modulo_case() {
+        assert_eq!(
+            printer_name_from_uri("supvan://x", "Supvan T50 Series t0117a2410211517"),
+            "supvan_t50_series_t0117a2410211517"
+        );
+        // Collapses runs of separators and trims leading/trailing ones.
+        assert_eq!(printer_name_from_uri("", "  Brother  HL-2270DW  "), "brother_hl_2270dw");
+        // Falls back to the URI when info is empty, and never yields empty.
+        assert_eq!(printer_name_from_uri("supvan://t0117", ""), "supvan_t0117");
+        assert_eq!(printer_name_from_uri("", "***"), "printer");
+    }
+
+    struct NoopBackend;
+    impl DeviceBackend for NoopBackend {
+        fn list(&self, _emit: &mut dyn FnMut(&str, &str, &str) -> bool) {}
+        fn driver_for_device(&self, _id: &str, _uri: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn test_config(name: &str) -> PrinterConfig {
+        PrinterConfig {
+            name: name.into(),
+            display_name: String::new(),
+            driver_name: "test".into(),
+            make_and_model: "Test".into(),
+            device_id: String::new(),
+            device_uri: "mock://x".into(),
+            dpi: 203,
+            printhead_width_dots: 384,
+            media_names: vec![],
+            media_sizes: vec![],
+            darkness: 50,
+            document_formats: vec![],
+        }
+    }
+
+    fn test_state(print_job: PrintJobFn, tag: &str) -> AppState {
+        let registry: PrinterRegistry =
+            Arc::new(parking_lot::RwLock::new(vec![PrinterRecord::new(test_config("p"))]));
+        AppState {
+            host: "127.0.0.1".into(),
+            port: 0,
+            printers: registry,
+            print_job,
+            state_path: std::env::temp_dir().join(format!("ipp-worker-test-{tag}.json")),
+            jobs: crate::job::JobRegistry::new(),
+            device_backend: Arc::new(NoopBackend),
+        }
+    }
+
+    /// Drive a job to a terminal state, polling the registry. Returns the final
+    /// job state (or panics on timeout).
+    fn run_to_terminal(state: &AppState, id: crate::job::JobId) -> JobState {
+        for _ in 0..500 {
+            let s = state.jobs.get(id).unwrap().state;
+            if matches!(s, JobState::Completed | JobState::Aborted | JobState::Canceled) {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("job {id} did not reach a terminal state");
+    }
+
+    /// A `DeviceUnavailable` outcome must HOLD the job and retry it until the
+    /// device prints — the paper-jam / offline behavior — not abort it.
+    #[test]
+    fn device_unavailable_holds_and_retries_until_it_prints() {
+        std::env::set_var("IPP_PRINTER_APP_RETRY_MS", "5");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = attempts.clone();
+        let print_job: PrintJobFn = Arc::new(move |_ctx, _payload, _copies| {
+            // Unavailable for the first two attempts, then it prints.
+            if a.fetch_add(1, Ordering::SeqCst) < 2 {
+                JobOutcome::DeviceUnavailable { reasons: PrinterReason::OFFLINE }
+            } else {
+                JobOutcome::Completed
+            }
+        });
+        let state = test_state(print_job, "hold");
+        let job = state.jobs.create("p".into(), "tester".into());
+        let id = job.id;
+        spawn_print_worker(&state, "p".into(), job, vec![1, 2, 3], 1, "image/pwg-raster".into());
+
+        assert_eq!(
+            run_to_terminal(&state, id),
+            JobState::Completed,
+            "a held job must eventually print, not abort"
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 3,
+            "the framework should have retried the held job"
+        );
+    }
+
+    /// A `Failed` outcome is a permanent abort — no retry.
+    #[test]
+    fn failed_outcome_aborts_without_retry() {
+        std::env::set_var("IPP_PRINTER_APP_RETRY_MS", "5");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a = attempts.clone();
+        let print_job: PrintJobFn = Arc::new(move |_ctx, _payload, _copies| {
+            a.fetch_add(1, Ordering::SeqCst);
+            JobOutcome::Failed(JobFailure::other("unsupported document"))
+        });
+        let state = test_state(print_job, "fail");
+        let job = state.jobs.create("p".into(), "tester".into());
+        let id = job.id;
+        spawn_print_worker(&state, "p".into(), job, vec![0], 1, "x".into());
+
+        assert_eq!(run_to_terminal(&state, id), JobState::Aborted);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a Failed outcome must not be retried"
+        );
+    }
+
+    /// Canceling a held job stops the retry loop promptly.
+    #[test]
+    fn canceling_a_held_job_stops_the_retries() {
+        std::env::set_var("IPP_PRINTER_APP_RETRY_MS", "5");
+        let print_job: PrintJobFn = Arc::new(|_ctx, _payload, _copies| {
+            // Never recovers — only a cancel can end this.
+            JobOutcome::DeviceUnavailable { reasons: PrinterReason::MEDIA_JAM }
+        });
+        let state = test_state(print_job, "cancel");
+        let job = state.jobs.create("p".into(), "tester".into());
+        let id = job.id;
+        let cancel = job.cancel_flag.clone();
+        spawn_print_worker(&state, "p".into(), job, vec![0], 1, "x".into());
+        // Let it hold a couple of rounds, then cancel.
+        std::thread::sleep(Duration::from_millis(40));
+        state.jobs.cancel(id);
+        let _ = cancel; // cancel() set the flag the worker polls
+        assert_eq!(run_to_terminal(&state, id), JobState::Canceled);
+    }
 }

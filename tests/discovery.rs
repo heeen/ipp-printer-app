@@ -59,9 +59,16 @@ impl DeviceBackend for MockBackend {
     }
 }
 
-fn make_config(name: &str, driver: &str, uri: &str, device_id: &str) -> Option<PrinterConfig> {
+fn make_config(
+    name: &str,
+    info: &str,
+    driver: &str,
+    uri: &str,
+    device_id: &str,
+) -> Option<PrinterConfig> {
     Some(PrinterConfig {
         name: name.to_string(),
+        display_name: info.to_string(),
         driver_name: driver.to_string(),
         make_and_model: "Mock Printer".to_string(),
         device_id: device_id.to_string(),

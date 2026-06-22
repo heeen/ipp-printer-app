@@ -31,6 +31,6 @@ pub use device::{DeviceBackend, PollStatus, ReadyMedia};
 pub use flags::PrinterReason;
 pub use job::{JobId, JobRecord, JobRegistry, JobState};
 pub use printer::{PrinterConfig, PrinterHandle, PrinterRecord, PrinterRegistry};
-pub use raster::{JobFailure, JobOptions, RasterDriver};
+pub use raster::{JobFailure, JobOptions, JobOutcome, RasterDriver};
 pub use server::{JobContext, Server, ServerOptions};
 pub use state::{default_state_path, PersistedState};

@@ -36,9 +36,16 @@ impl DeviceBackend for DemoBackend {
     }
 }
 
-fn make_config(name: &str, driver: &str, uri: &str, device_id: &str) -> Option<PrinterConfig> {
+fn make_config(
+    name: &str,
+    info: &str,
+    driver: &str,
+    uri: &str,
+    device_id: &str,
+) -> Option<PrinterConfig> {
     Some(PrinterConfig {
         name: name.to_string(),
+        display_name: info.to_string(),
         driver_name: driver.to_string(),
         make_and_model: "Demo Printer".into(),
         device_id: device_id.to_string(),
@@ -78,7 +85,10 @@ async fn main() -> std::io::Result<()> {
                 raster.len(),
                 copies
             );
-            Ok(())
+            // A real device backend would return DeviceUnavailable when the
+            // hardware can't be reached (the framework then holds + retries the
+            // job) or Failed for a bad document. The demo always succeeds.
+            ipp_printer_app::JobOutcome::Completed
         }),
         state_path,
         advertise_mdns: true,

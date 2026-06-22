@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.7.0 — 2026-06-22
+
+Make the framework behave like a real printer when the device isn't ready,
+separate logical names from display names, and stop a co-resident CUPS from
+creating a duplicate on-demand queue.
+
+### Hold-on-device-unavailable + offline presence (breaking)
+
+- **The print callback now returns [`JobOutcome`]** instead of
+  `Result<(), JobFailure>`, and takes the payload by reference:
+  `Fn(JobContext, &[u8], u32) -> JobOutcome`. The variants are `Completed`,
+  `DeviceUnavailable { reasons }`, and `Failed(JobFailure)`. The framework is
+  the spooler — an implementor classifies one attempt and the framework decides
+  what to do. `DeviceUnavailable` makes it **hold the job** (`processing-stopped`)
+  and re-invoke the callback with capped backoff (2 s→30 s) until it prints or
+  the client cancels — the way a printer holds a job through a paper jam, rather
+  than dropping it. The printer stays `Processing` while held so the status
+  poller never contends with the device. New `JobContext::is_canceled()` for
+  callbacks that loop.
+- **The DNS-SD advert tracks device presence.** The status poller withdraws a
+  printer's advert when its device reports `OFFLINE` and republishes it when the
+  device returns, so a powered-off printer drops out of print dialogs. Driven by
+  a new `AdvertiserControl` trait (implemented by `Advertiser`), reconciled
+  every poll against reachability (not edge-triggered, so a held job that drove
+  the printer `Stopped→Processing→Idle` still gets its advert restored).
+  `status::spawn` gains an `Option<Arc<dyn AdvertiserControl>>` argument.
+- An unreachable device now reports `printer-state = stopped` +
+  `offline-report` (the poller drives `printer-state`, and polls `Stopped`
+  printers too so they recover).
+
+### Logical vs display names
+
+Separate logical names from display names, and stop a co-resident CUPS from
+creating a duplicate on-demand queue.
+
+CUPS auto-creates a temporary queue from any DNS-SD advert unless a queue
+already exists with the same (sanitized) name or device-uri. Our proposed
+queue name used `-` separators, while CUPS's `cups_queue_name()` uses `_`, so
+the names never matched and CUPS spun up a `printer-is-temporary` duplicate.
+Now the proposed name mirrors `cups_queue_name` (lowercase, each non-alnum run
+→ one `_`); since CUPS's printer lookup is case-insensitive, our persistent
+queue matches the queue CUPS would derive from the (spaced, mixed-case) DNS-SD
+instance name, so no duplicate is created.
+
+### Breaking changes
+
+- **`PrinterConfig` gains `display_name: String`** (`#[serde(default)]`, so old
+  state loads). The human-readable label shown to users: the mDNS **service
+  instance name** (what OS print dialogs display), IPP `printer-info`, and the
+  web UI. Empty falls back to `make_and_model`, then `name`. The logical `name`
+  is now reserved for the machine-readable identity (queue name, IPP
+  `printer-name`, `/ipp/print/<name>` path, mDNS `rp`). New accessor
+  `PrinterConfig::display_label()`.
+- **`bootstrap_printers`'s `make_config` callback gains an `info` parameter**
+  (now `Fn(name, info, driver, uri, device_id)`). `info` is the backend's
+  human-readable string — set `display_name` from it.
+- The bootstrap-proposed `name` now uses `_` separators (was `-`).
+
 ## 0.6.1 — 2026-06-22
 
 Restrict mDNS advertising to real interfaces. `enable_addr_auto()` published the

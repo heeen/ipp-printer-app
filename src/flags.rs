@@ -70,6 +70,29 @@ impl PrinterReason {
             .map(|(_, kw)| kw)
             .collect()
     }
+
+    /// True if any set reason is a transient, user-clearable condition that
+    /// stops printing *now* but will let the job through once resolved —
+    /// offline, paper jam, out of media, cover/door open, supply empty.
+    ///
+    /// A device backend can use this to decide whether a print failure should
+    /// become [`crate::JobOutcome::DeviceUnavailable`] (the framework holds and
+    /// retries the job, like a printer holding a job through a jam) rather than
+    /// [`crate::JobOutcome::Failed`] (a permanent abort). A pure-`OTHER` or
+    /// empty reason set is *not* recoverable.
+    pub fn is_recoverable(self) -> bool {
+        self.intersects(
+            Self::OFFLINE
+                | Self::MEDIA_JAM
+                | Self::MEDIA_EMPTY
+                | Self::MEDIA_NEEDED
+                | Self::INPUT_TRAY_MISSING
+                | Self::COVER_OPEN
+                | Self::DOOR_OPEN
+                | Self::MARKER_SUPPLY_EMPTY
+                | Self::TONER_EMPTY,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +116,22 @@ mod tests {
         assert!(kws.contains(&"cover-open"));
         assert!(kws.contains(&"media-empty"));
         assert!(!kws.contains(&"none"));
+    }
+
+    #[test]
+    fn recoverable_conditions_hold_the_job() {
+        // Clearable physical conditions → the job should be held + retried.
+        for r in [
+            PrinterReason::OFFLINE,
+            PrinterReason::MEDIA_JAM,
+            PrinterReason::MEDIA_EMPTY,
+            PrinterReason::COVER_OPEN,
+            PrinterReason::MEDIA_NEEDED | PrinterReason::OTHER, // any recoverable bit counts
+        ] {
+            assert!(r.is_recoverable(), "{r:?} should be recoverable");
+        }
+        // A bare/unknown failure is a permanent abort, not a hold.
+        assert!(!PrinterReason::OTHER.is_recoverable());
+        assert!(!PrinterReason::empty().is_recoverable());
     }
 }

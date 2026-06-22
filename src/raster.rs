@@ -1,5 +1,33 @@
 //! [`RasterDriver`] trait + page-header DTO for raster print jobs.
 
+/// What a print-job callback reports back to the framework. The framework is
+/// the spooler: it decides what happens to the job based on this value, so an
+/// implementor only has to classify the result of one attempt — never write
+/// its own retry/queue logic.
+///
+/// This is what makes a printer application behave like a *printer*: a device
+/// that isn't ready (powered off, busy, paper being reloaded) must not drop the
+/// job — it returns [`JobOutcome::DeviceUnavailable`] and the framework holds
+/// the job (`job-state = processing-stopped`) and retries it until the device
+/// is back, the same way a real printer holds a job through a paper jam.
+#[derive(Debug, Clone)]
+pub enum JobOutcome {
+    /// The document was printed. The job completes.
+    Completed,
+    /// The device can't print right now but is expected to recover. The
+    /// framework keeps the job and re-invokes the callback (with backoff) until
+    /// it prints or the client cancels it, surfacing `reasons` on the printer
+    /// (`printer-state-reasons`) meanwhile. Return this for transient device
+    /// conditions — unreachable hardware, busy link, media being reloaded.
+    DeviceUnavailable {
+        /// Reasons to surface while held, e.g. [`crate::flags::PrinterReason::OFFLINE`].
+        reasons: crate::flags::PrinterReason,
+    },
+    /// Permanent failure for *this* document (corrupt/unsupported data, a size
+    /// the device can't handle, …). The job aborts; retrying wouldn't help.
+    Failed(JobFailure),
+}
+
 /// Failure of a print job, carrying IPP-visible printer reasons + a message.
 #[derive(Debug, Clone)]
 pub struct JobFailure {

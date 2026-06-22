@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use parking_lot::Mutex;
 
-use crate::printer::PrinterRegistry;
+use crate::printer::{PrinterRecord, PrinterRegistry};
+use crate::status::AdvertiserControl;
 
 const IPP_SERVICE: &str = "_ipp._tcp.local.";
 
@@ -29,41 +31,78 @@ const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
     "veth", "docker", "br-", "virbr", "vnet", "vmnet", "vboxnet",
 ];
 
-/// Holds the [`ServiceDaemon`] and the list of registered fullnames so we can
-/// unregister cleanly on drop.
+/// Owns the [`ServiceDaemon`] and the bind-time host/addresses, and tracks the
+/// DNS-SD fullname registered for each printer so individual services can be
+/// withdrawn and republished as devices go offline / come back.
 pub struct Advertiser {
     daemon: ServiceDaemon,
-    fullnames: Vec<String>,
+    port: u16,
+    host: String,
+    addrs: Vec<IpAddr>,
+    /// printer logical name -> registered DNS-SD fullname.
+    registered: Mutex<HashMap<String, String>>,
 }
 
 impl Advertiser {
     /// Start a daemon and register every printer in the registry.
     pub fn register_all(registry: &PrinterRegistry, port: u16) -> mdns_sd::Result<Self> {
-        let daemon = ServiceDaemon::new()?;
-        let host = hostname();
-        let addrs = advertise_addrs();
-        let mut fullnames = Vec::new();
+        let me = Self {
+            daemon: ServiceDaemon::new()?,
+            port,
+            host: hostname(),
+            addrs: advertise_addrs(),
+            registered: Mutex::new(HashMap::new()),
+        };
         for rec in registry.read().iter() {
-            let info = service_info(
-                &host,
-                &addrs,
-                port,
-                &rec.config.name,
-                &rec.config.make_and_model,
-                &rec.uuid,
-            )?;
-            let fullname = info.get_fullname().to_string();
-            daemon.register(info)?;
-            log::info!("mdns: registered {fullname}");
-            fullnames.push(fullname);
+            me.register_one(rec)?;
         }
-        Ok(Self { daemon, fullnames })
+        Ok(me)
+    }
+
+    /// Build + register one printer's service, recording its fullname.
+    /// Replaces any existing registration for the same logical name.
+    fn register_one(&self, rec: &PrinterRecord) -> mdns_sd::Result<()> {
+        let info = service_info(
+            &self.host,
+            &self.addrs,
+            self.port,
+            rec.config.display_label(),
+            &rec.config.name,
+            &rec.config.make_and_model,
+            &rec.uuid,
+        )?;
+        let fullname = info.get_fullname().to_string();
+        self.daemon.register(info)?;
+        log::info!("mdns: registered {fullname}");
+        self.registered.lock().insert(rec.config.name.clone(), fullname);
+        Ok(())
+    }
+}
+
+impl AdvertiserControl for Advertiser {
+    fn publish(&self, rec: &PrinterRecord) {
+        if !self.registered.lock().contains_key(&rec.config.name) {
+            if let Err(e) = self.register_one(rec) {
+                log::warn!("mdns: republish of {} failed: {e}", rec.config.name);
+            }
+        }
+    }
+
+    fn withdraw(&self, name: &str) {
+        if let Some(fullname) = self.registered.lock().remove(name) {
+            log::info!("mdns: withdrawing {fullname} (device offline)");
+            let _ = self.daemon.unregister(&fullname);
+        }
+    }
+
+    fn is_advertised(&self, name: &str) -> bool {
+        self.registered.lock().contains_key(name)
     }
 }
 
 impl Drop for Advertiser {
     fn drop(&mut self) {
-        for fullname in &self.fullnames {
+        for fullname in self.registered.lock().values() {
             let _ = self.daemon.unregister(fullname);
         }
         let _ = self.daemon.shutdown();
@@ -123,12 +162,15 @@ fn service_info(
     host: &str,
     addrs: &[IpAddr],
     port: u16,
-    name: &str,
+    instance_name: &str,
+    logical_name: &str,
     make_and_model: &str,
     uuid: &str,
 ) -> mdns_sd::Result<ServiceInfo> {
     let mut txt: HashMap<String, String> = HashMap::new();
-    txt.insert("rp".into(), format!("ipp/print/{name}"));
+    // `rp` is the IPP resource path on our server — always the logical name.
+    // The DNS-SD *instance* name (below) carries the human-readable label.
+    txt.insert("rp".into(), format!("ipp/print/{logical_name}"));
     // `UUID=` lets a local cups-browsed dedupe this advert against a CUPS
     // queue with the same `printer-uuid` and stand down (it's the same
     // mechanism CUPS's own shared queues use). Advertise the bare value —
@@ -162,7 +204,7 @@ fn service_info(
     let info = if addrs.is_empty() {
         ServiceInfo::new(
             IPP_SERVICE,
-            name,
+            instance_name,
             &format!("{host}.local."),
             "", // IPs filled by enable_addr_auto
             port,
@@ -172,7 +214,7 @@ fn service_info(
     } else {
         ServiceInfo::new(
             IPP_SERVICE,
-            name,
+            instance_name,
             &format!("{host}.local."),
             addrs,
             port,

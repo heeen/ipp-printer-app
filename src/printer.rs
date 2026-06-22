@@ -12,7 +12,19 @@ use crate::flags::PrinterReason;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct PrinterConfig {
+    /// Logical, machine-readable name: the CUPS queue name, the IPP
+    /// `printer-name`, the `/ipp/print/<name>` resource path, and the mDNS
+    /// `rp` TXT all use this. Keep it to `[a-z0-9_]` so it round-trips through
+    /// CUPS's own DNS-SD queue-name sanitiser (`cups_queue_name`), letting a
+    /// co-resident CUPS recognise its on-demand temp queue as already-served
+    /// (its lookup is case-insensitive).
     pub name: String,
+    /// Human-readable name shown to users: the mDNS **service instance name**
+    /// (what OS print dialogs display), IPP `printer-info`, and the web UI.
+    /// May contain spaces / mixed case. Empty falls back to `make_and_model`,
+    /// then `name`. `#[serde(default)]` so older persisted state still loads.
+    #[serde(default)]
+    pub display_name: String,
     pub driver_name: String,
     pub make_and_model: String,
     pub device_id: String,
@@ -43,6 +55,19 @@ impl PrinterConfig {
             host
         };
         format!("ipp://{h}:{port}/ipp/print/{}", self.name)
+    }
+
+    /// The effective human-readable label: `display_name` if set, else
+    /// `make_and_model`, else the logical `name`. Used for the mDNS service
+    /// instance name, IPP `printer-info`, and the web UI.
+    pub fn display_label(&self) -> &str {
+        if !self.display_name.is_empty() {
+            &self.display_name
+        } else if !self.make_and_model.is_empty() {
+            &self.make_and_model
+        } else {
+            &self.name
+        }
     }
 }
 

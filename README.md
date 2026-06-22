@@ -52,8 +52,9 @@ async fn main() -> std::io::Result<()> {
     let backend = Arc::new(MyBackend);
 
     Server::bootstrap_printers(&registry, backend.as_ref(), &state_path,
-        |name, driver, uri, device_id| Some(PrinterConfig {
+        |name, info, driver, uri, device_id| Some(PrinterConfig {
             name: name.into(),
+            display_name: info.into(),
             driver_name: driver.into(),
             make_and_model: "My Printer".into(),
             device_id: device_id.into(),

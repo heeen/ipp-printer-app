@@ -156,7 +156,7 @@ pub fn get_printer_attributes(
         attrs,
         p,
         "printer-info",
-        IppValue::TextWithoutLanguage(cfg.make_and_model.as_str().try_into().unwrap()),
+        IppValue::TextWithoutLanguage(cfg.display_label().try_into().unwrap()),
     );
     add(
         attrs,
