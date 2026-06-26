@@ -50,15 +50,32 @@ impl PollStatus {
     }
 }
 
+/// One physical device surfaced by [`DeviceBackend::list`].
+#[derive(Debug, Clone)]
+pub struct DiscoveredDevice {
+    /// Human-readable description (becomes the DNS-SD instance name / info).
+    pub info: String,
+    /// Device URI the framework opens and persists.
+    pub uri: String,
+    /// IEEE 1284 device-id string used to resolve a driver.
+    pub device_id: String,
+}
+
 /// Enumerate physical printers and report their live health.
 ///
 /// Implementations describe how to discover devices (e.g. via sysfs, BlueZ,
 /// USB enumeration) and how to map their identifying strings to a driver
 /// name registered with the framework.
+///
+/// `driver_for_device` is synchronous (pure string matching); `list`,
+/// `poll_status`, and `identify` are async so a backend can await its device
+/// transport (USB, Bluetooth, BLE) — e.g. a BLE LE scan or a per-device probe.
+#[async_trait::async_trait]
 pub trait DeviceBackend: Send + Sync {
-    /// Call `emit(info, uri, device_id)` for each discovered device. The
-    /// closure returns `true` to continue enumeration, `false` to stop early.
-    fn list(&self, emit: &mut dyn FnMut(&str, &str, &str) -> bool);
+    /// Discover the currently-attached devices. Returning an owned `Vec` (vs a
+    /// borrowed callback) keeps the method cleanly `async` — a backend can
+    /// `.await` a scan/probe without lifetime gymnastics around an emit closure.
+    async fn list(&self) -> Vec<DiscoveredDevice>;
 
     /// Map a device's IEEE 1284 `device-id` string and URI to a driver name
     /// that this backend recognises. Return `None` for "this isn't one of
@@ -70,7 +87,7 @@ pub trait DeviceBackend: Send + Sync {
     /// value changes. Returning `None` means "no update" (keep whatever the
     /// registry already holds); returning `Some` carries the fresh reasons and,
     /// optionally, the loaded media and remaining-supply level.
-    fn poll_status(&self, _config: &PrinterConfig) -> Option<PollStatus> {
+    async fn poll_status(&self, _config: &PrinterConfig) -> Option<PollStatus> {
         None
     }
 
@@ -79,5 +96,5 @@ pub trait DeviceBackend: Send + Sync {
     /// holds the requested `identify-actions` keywords (`display`, `sound`,
     /// `flash`, `speak`); an empty slice means "use the default action".
     /// Default: no-op.
-    fn identify(&self, _config: &PrinterConfig, _actions: &[String]) {}
+    async fn identify(&self, _config: &PrinterConfig, _actions: &[String]) {}
 }

@@ -106,9 +106,15 @@ impl JobOptions {
 /// `end_page` transfers the page to the device, `end_job` releases
 /// resources. The framework's IPP `Print-Job` handler drives this trait;
 /// you only need to provide a type that knows how to talk to your device.
+///
+/// `start_job`/`start_page`/`write_line` are synchronous (they only build and
+/// fill the page buffer); the device-touching `end_page`/`end_job` are async so
+/// the driver can await a transport (USB HID, Bluetooth RFCOMM, BLE GATT)
+/// without blocking the runtime.
+#[async_trait::async_trait]
 pub trait RasterDriver: Sized + Send + 'static {
     /// The driver's opaque device handle (e.g. an open HID descriptor).
-    type Device: Send;
+    type Device: Send + Sync;
 
     /// Allocate per-job state. Called once at the top of each job.
     fn start_job(
@@ -136,7 +142,7 @@ pub trait RasterDriver: Sized + Send + 'static {
     ) -> Result<(), JobFailure>;
 
     /// Transfer the completed page to the device (and repeat for copies).
-    fn end_page(
+    async fn end_page(
         &mut self,
         options: &JobOptions,
         page: u32,
@@ -144,5 +150,5 @@ pub trait RasterDriver: Sized + Send + 'static {
     ) -> Result<(), JobFailure>;
 
     /// Release per-job state. Called once at the end of the job.
-    fn end_job(self, device: &Self::Device);
+    async fn end_job(self, device: &Self::Device);
 }

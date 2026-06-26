@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ipp_printer_app::{
-    DeviceBackend, PersistedState, PrinterConfig, PrinterRegistry, Server,
+    DeviceBackend, DiscoveredDevice, PersistedState, PrinterConfig, PrinterRegistry, Server,
 };
 use parking_lot::RwLock;
 
@@ -45,13 +45,19 @@ impl MockBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl DeviceBackend for MockBackend {
-    fn list(&self, emit: &mut dyn FnMut(&str, &str, &str) -> bool) {
-        for s in self.devices.lock().unwrap().iter() {
-            if !emit(&s.info, &s.uri, &s.device_id) {
-                break;
-            }
-        }
+    async fn list(&self) -> Vec<DiscoveredDevice> {
+        self.devices
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| DiscoveredDevice {
+                info: s.info.clone(),
+                uri: s.uri.clone(),
+                device_id: s.device_id.clone(),
+            })
+            .collect()
     }
 
     fn driver_for_device(&self, _device_id: &str, _device_uri: &str) -> Option<String> {
@@ -94,14 +100,14 @@ fn empty_registry() -> PrinterRegistry {
     Arc::new(RwLock::new(Vec::new()))
 }
 
-#[test]
-fn first_sighting_registers_and_persists() {
+#[tokio::test]
+async fn first_sighting_registers_and_persists() {
     let state = fresh_state_path();
     let _ = std::fs::remove_file(&state);
     let registry = empty_registry();
     let backend = MockBackend::with(vec![Sighting::new("usbhid://bus-5-2")]);
 
-    Server::bootstrap_printers(&registry, &backend, &state, make_config);
+    Server::bootstrap_printers(&registry, &backend, &state, make_config).await;
 
     let records = registry.read();
     assert_eq!(records.len(), 1, "one device should be registered");
@@ -116,14 +122,14 @@ fn first_sighting_registers_and_persists() {
     let _ = std::fs::remove_file(&state);
 }
 
-#[test]
-fn device_disappears_but_queue_survives() {
+#[tokio::test]
+async fn device_disappears_but_queue_survives() {
     // Round 1: device on, gets registered.
     let state = fresh_state_path();
     let _ = std::fs::remove_file(&state);
     let backend = MockBackend::with(vec![Sighting::new("usbhid://bus-5-2")]);
     let registry = empty_registry();
-    Server::bootstrap_printers(&registry, &backend, &state, make_config);
+    Server::bootstrap_printers(&registry, &backend, &state, make_config).await;
     assert_eq!(registry.read().len(), 1);
     drop(registry);
 
@@ -131,7 +137,7 @@ fn device_disappears_but_queue_survives() {
     // state file is still on disk. Device is now OFF (backend lists nothing).
     backend.set(vec![]);
     let registry = empty_registry();
-    Server::bootstrap_printers(&registry, &backend, &state, make_config);
+    Server::bootstrap_printers(&registry, &backend, &state, make_config).await;
 
     let records = registry.read();
     assert_eq!(
@@ -144,26 +150,26 @@ fn device_disappears_but_queue_survives() {
     let _ = std::fs::remove_file(&state);
 }
 
-#[test]
-fn device_reappears_no_duplicate() {
+#[tokio::test]
+async fn device_reappears_no_duplicate() {
     // Round 1: register the device.
     let state = fresh_state_path();
     let _ = std::fs::remove_file(&state);
     let backend = MockBackend::with(vec![Sighting::new("usbhid://bus-5-2")]);
     let registry = empty_registry();
-    Server::bootstrap_printers(&registry, &backend, &state, make_config);
+    Server::bootstrap_printers(&registry, &backend, &state, make_config).await;
     drop(registry);
 
     // Round 2: device off, queue survives (covered by previous test).
     backend.set(vec![]);
     let registry = empty_registry();
-    Server::bootstrap_printers(&registry, &backend, &state, make_config);
+    Server::bootstrap_printers(&registry, &backend, &state, make_config).await;
     drop(registry);
 
     // Round 3: device on again.
     backend.set(vec![Sighting::new("usbhid://bus-5-2")]);
     let registry = empty_registry();
-    Server::bootstrap_printers(&registry, &backend, &state, make_config);
+    Server::bootstrap_printers(&registry, &backend, &state, make_config).await;
 
     let records = registry.read();
     assert_eq!(
@@ -175,14 +181,14 @@ fn device_reappears_no_duplicate() {
     let _ = std::fs::remove_file(&state);
 }
 
-#[test]
-fn new_device_added_alongside_existing() {
+#[tokio::test]
+async fn new_device_added_alongside_existing() {
     // Existing device persists; a freshly-discovered second device is added.
     let state = fresh_state_path();
     let _ = std::fs::remove_file(&state);
     let backend = MockBackend::with(vec![Sighting::new("usbhid://bus-5-2")]);
     let registry = empty_registry();
-    Server::bootstrap_printers(&registry, &backend, &state, make_config);
+    Server::bootstrap_printers(&registry, &backend, &state, make_config).await;
     drop(registry);
 
     backend.set(vec![
@@ -190,7 +196,7 @@ fn new_device_added_alongside_existing() {
         Sighting::new("btrfcomm://hci0/AA:BB:CC:DD:EE:FF"),
     ]);
     let registry = empty_registry();
-    Server::bootstrap_printers(&registry, &backend, &state, make_config);
+    Server::bootstrap_printers(&registry, &backend, &state, make_config).await;
 
     let records = registry.read();
     assert_eq!(records.len(), 2);
@@ -201,12 +207,17 @@ fn new_device_added_alongside_existing() {
     let _ = std::fs::remove_file(&state);
 }
 
-#[test]
-fn backend_returning_no_driver_skips_device() {
+#[tokio::test]
+async fn backend_returning_no_driver_skips_device() {
     struct NoDriverBackend;
+    #[async_trait::async_trait]
     impl DeviceBackend for NoDriverBackend {
-        fn list(&self, emit: &mut dyn FnMut(&str, &str, &str) -> bool) {
-            emit("Mystery", "usbhid://mystery", "");
+        async fn list(&self) -> Vec<DiscoveredDevice> {
+            vec![DiscoveredDevice {
+                info: "Mystery".into(),
+                uri: "usbhid://mystery".into(),
+                device_id: String::new(),
+            }]
         }
         fn driver_for_device(&self, _: &str, _: &str) -> Option<String> {
             None
@@ -216,7 +227,7 @@ fn backend_returning_no_driver_skips_device() {
     let state = fresh_state_path();
     let _ = std::fs::remove_file(&state);
     let registry = empty_registry();
-    Server::bootstrap_printers(&registry, &NoDriverBackend, &state, make_config);
+    Server::bootstrap_printers(&registry, &NoDriverBackend, &state, make_config).await;
 
     assert!(
         registry.read().is_empty(),

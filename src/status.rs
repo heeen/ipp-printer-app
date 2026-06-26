@@ -77,10 +77,11 @@ async fn poll_once(
     };
 
     for cfg in configs {
-        // `poll_status` may block on a HID read; let it run in the blocking
-        // section so other tasks (Get-Printer-Attributes, etc.) stay responsive.
-        let status = tokio::task::block_in_place(|| backend.poll_status(&cfg));
-        let Some(status) = status else { continue };
+        // `poll_status` awaits the device transport; the backend bridges any
+        // blocking FFI internally so other tasks stay responsive.
+        let Some(status) = backend.poll_status(&cfg).await else {
+            continue;
+        };
 
         // `reachable` is the source of truth for both printer-state and the
         // discovery advert. Snapshot the record (for a possible republish)
@@ -159,12 +160,15 @@ mod tests {
     struct FakeBackend {
         reasons: Mutex<PrinterReason>,
     }
+    #[async_trait::async_trait]
     impl DeviceBackend for FakeBackend {
-        fn list(&self, _emit: &mut dyn FnMut(&str, &str, &str) -> bool) {}
+        async fn list(&self) -> Vec<crate::device::DiscoveredDevice> {
+            Vec::new()
+        }
         fn driver_for_device(&self, _id: &str, _uri: &str) -> Option<String> {
             None
         }
-        fn poll_status(&self, _config: &PrinterConfig) -> Option<PollStatus> {
+        async fn poll_status(&self, _config: &PrinterConfig) -> Option<PollStatus> {
             Some(PollStatus {
                 reasons: *self.reasons.lock(),
                 ready_media: None,

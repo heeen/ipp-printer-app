@@ -27,10 +27,10 @@ pub mod server;
 pub mod state;
 pub mod status;
 
-pub use device::{DeviceBackend, PollStatus, ReadyMedia};
+pub use device::{DeviceBackend, DiscoveredDevice, PollStatus, ReadyMedia};
 pub use flags::PrinterReason;
 pub use job::{JobId, JobRecord, JobRegistry, JobState};
 pub use printer::{PrinterConfig, PrinterHandle, PrinterRecord, PrinterRegistry};
 pub use raster::{JobFailure, JobOptions, JobOutcome, RasterDriver};
-pub use server::{JobContext, Server, ServerOptions};
+pub use server::{JobContext, PrintJobFn, PrintJobFuture, Server, ServerOptions};
 pub use state::{default_state_path, PersistedState};

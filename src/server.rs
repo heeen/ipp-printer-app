@@ -59,7 +59,16 @@ impl JobContext {
 /// `DeviceUnavailable`, not `Failed`. Do any cheap reachability check (opening
 /// the device) *first* so a held retry is cheap. The callback should also bail
 /// early if [`JobContext::is_canceled`] becomes true.
-pub type PrintJobFn = Arc<dyn Fn(JobContext, &[u8], u32) -> crate::raster::JobOutcome + Send + Sync>;
+/// Boxed, owned future a [`PrintJobFn`] returns. The payload is handed over as
+/// an `Arc<[u8]>` (not a borrow) so the future is `'static` and can run on a
+/// spawned task that outlives the call.
+pub type PrintJobFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = crate::raster::JobOutcome> + Send>>;
+
+/// The print-job callback: given a job context, the document payload, and a
+/// copy count, returns a future resolving to the [`crate::raster::JobOutcome`].
+/// The framework drives spooling/retry around it.
+pub type PrintJobFn = Arc<dyn Fn(JobContext, Arc<[u8]>, u32) -> PrintJobFuture + Send + Sync>;
 
 /// Server configuration. Construct in your `main`, hand to [`Server::run`].
 #[allow(missing_docs)]
@@ -161,7 +170,7 @@ impl Server {
     }
 
     /// Load printers from disk, discover devices, merge into registry.
-    pub fn bootstrap_printers(
+    pub async fn bootstrap_printers(
         registry: &PrinterRegistry,
         backend: &dyn DeviceBackend,
         state_path: &std::path::Path,
@@ -173,22 +182,20 @@ impl Server {
             .map(PrinterRecord::new)
             .collect();
 
-        backend.list(&mut |info, uri, device_id| {
-            let driver = match backend.driver_for_device(device_id, uri) {
-                Some(d) => d,
-                None => return true,
+        for d in backend.list().await {
+            let Some(driver) = backend.driver_for_device(&d.device_id, &d.uri) else {
+                continue;
             };
-            let name = printer_name_from_uri(uri, info);
-            if records.iter().any(|r| r.config.device_uri == uri) {
-                return true;
+            let name = printer_name_from_uri(&d.uri, &d.info);
+            if records.iter().any(|r| r.config.device_uri == d.uri) {
+                continue;
             }
-            let Some(cfg) = make_config(&name, info, &driver, uri, device_id) else {
-                return true;
+            let Some(cfg) = make_config(&name, &d.info, &driver, &d.uri, &d.device_id) else {
+                continue;
             };
-            log::info!("auto-add printer {name} -> {uri}");
+            log::info!("auto-add printer {name} -> {}", d.uri);
             records.push(PrinterRecord::new(cfg));
-            true
-        });
+        }
 
         *registry.write() = records;
         Self::persist(registry, state_path);
@@ -290,7 +297,7 @@ async fn ipp_handler(
     Path(name): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    match handle_ipp(&state, &name, &body) {
+    match handle_ipp(&state, &name, &body).await {
         Ok(bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/ipp")],
@@ -304,7 +311,11 @@ async fn ipp_handler(
     }
 }
 
-fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (StatusCode, String)> {
+async fn handle_ipp(
+    state: &AppState,
+    name: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, (StatusCode, String)> {
     let mut req = IppParser::new(IppReader::new(Cursor::new(body.to_vec())))
         .parse()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("IPP parse error: {e}")))?;
@@ -403,7 +414,10 @@ fn handle_ipp(state: &AppState, name: &str, body: &[u8]) -> Result<Vec<u8>, (Sta
         }
         OP_IDENTIFY_PRINTER => {
             let actions = extract_identify_actions(&req);
-            state.device_backend.identify(&record.config, &actions);
+            state
+                .device_backend
+                .identify(&record.config, &actions)
+                .await;
             let resp =
                 IppRequestResponse::new_response(version, IppStatus::SuccessfulOk, request_id)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -744,7 +758,10 @@ fn spawn_print_worker(
     let state_clone = state.clone();
     let name_owned = printer_name;
     let job_for_worker = job;
-    std::thread::spawn(move || {
+    let payload: Arc<[u8]> = payload.into();
+    // Runs on the ambient tokio runtime (spawn_print_worker is called from the
+    // async IPP handler). The job future awaits the device transport directly.
+    tokio::spawn(async move {
         // The printer stays `Processing` for the whole life of the job —
         // including while held waiting for the device. That keeps the status
         // poller (which only touches Idle/Stopped printers) off the device so
@@ -783,7 +800,7 @@ fn spawn_print_worker(
             if ctx.is_canceled() {
                 break;
             }
-            match (state_clone.print_job)(ctx.clone(), &payload, copies) {
+            match (state_clone.print_job)(ctx.clone(), payload.clone(), copies).await {
                 JobOutcome::Completed => {
                     set_printer_reasons(&state_clone, &name_owned, crate::flags::PrinterReason::empty());
                     set_printer_idle_named(&state_clone, &name_owned);
@@ -814,7 +831,7 @@ fn spawn_print_worker(
                     // Surface the condition but keep printer-state Processing.
                     set_printer_reasons(&state_clone, &name_owned, reasons);
                     state_clone.jobs.set_state(job_for_worker.id, JobState::ProcessingStopped);
-                    if sleep_cancelable(&ctx.cancel_flag, backoff) {
+                    if sleep_cancelable(&ctx.cancel_flag, backoff).await {
                         break; // canceled during the wait
                     }
                     backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -850,7 +867,10 @@ fn set_printer_idle_named(state: &AppState, name: &str) {
 
 /// Sleep up to `dur`, waking early (and returning `true`) if the cancel flag is
 /// set. Polls in short slices so a Cancel-Job is honored promptly.
-fn sleep_cancelable(cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>, dur: Duration) -> bool {
+async fn sleep_cancelable(
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dur: Duration,
+) -> bool {
     const SLICE: Duration = Duration::from_millis(250);
     let mut left = dur;
     while left > Duration::ZERO {
@@ -858,7 +878,7 @@ fn sleep_cancelable(cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>, dur:
             return true;
         }
         let nap = left.min(SLICE);
-        std::thread::sleep(nap);
+        tokio::time::sleep(nap).await;
         left -= nap;
     }
     cancel.load(std::sync::atomic::Ordering::Acquire)
@@ -892,8 +912,11 @@ mod tests {
     }
 
     struct NoopBackend;
+    #[async_trait::async_trait]
     impl DeviceBackend for NoopBackend {
-        fn list(&self, _emit: &mut dyn FnMut(&str, &str, &str) -> bool) {}
+        async fn list(&self) -> Vec<crate::device::DiscoveredDevice> {
+            Vec::new()
+        }
         fn driver_for_device(&self, _id: &str, _uri: &str) -> Option<String> {
             None
         }
@@ -932,31 +955,34 @@ mod tests {
 
     /// Drive a job to a terminal state, polling the registry. Returns the final
     /// job state (or panics on timeout).
-    fn run_to_terminal(state: &AppState, id: crate::job::JobId) -> JobState {
+    async fn run_to_terminal(state: &AppState, id: crate::job::JobId) -> JobState {
         for _ in 0..500 {
             let s = state.jobs.get(id).unwrap().state;
             if matches!(s, JobState::Completed | JobState::Aborted | JobState::Canceled) {
                 return s;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("job {id} did not reach a terminal state");
     }
 
     /// A `DeviceUnavailable` outcome must HOLD the job and retry it until the
     /// device prints — the paper-jam / offline behavior — not abort it.
-    #[test]
-    fn device_unavailable_holds_and_retries_until_it_prints() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn device_unavailable_holds_and_retries_until_it_prints() {
         std::env::set_var("IPP_PRINTER_APP_RETRY_MS", "5");
         let attempts = Arc::new(AtomicUsize::new(0));
         let a = attempts.clone();
         let print_job: PrintJobFn = Arc::new(move |_ctx, _payload, _copies| {
-            // Unavailable for the first two attempts, then it prints.
-            if a.fetch_add(1, Ordering::SeqCst) < 2 {
-                JobOutcome::DeviceUnavailable { reasons: PrinterReason::OFFLINE }
-            } else {
-                JobOutcome::Completed
-            }
+            let a = a.clone();
+            Box::pin(async move {
+                // Unavailable for the first two attempts, then it prints.
+                if a.fetch_add(1, Ordering::SeqCst) < 2 {
+                    JobOutcome::DeviceUnavailable { reasons: PrinterReason::OFFLINE }
+                } else {
+                    JobOutcome::Completed
+                }
+            })
         });
         let state = test_state(print_job, "hold");
         let job = state.jobs.create("p".into(), "tester".into());
@@ -964,7 +990,7 @@ mod tests {
         spawn_print_worker(&state, "p".into(), job, vec![1, 2, 3], 1, "image/pwg-raster".into());
 
         assert_eq!(
-            run_to_terminal(&state, id),
+            run_to_terminal(&state, id).await,
             JobState::Completed,
             "a held job must eventually print, not abort"
         );
@@ -975,21 +1001,24 @@ mod tests {
     }
 
     /// A `Failed` outcome is a permanent abort — no retry.
-    #[test]
-    fn failed_outcome_aborts_without_retry() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_outcome_aborts_without_retry() {
         std::env::set_var("IPP_PRINTER_APP_RETRY_MS", "5");
         let attempts = Arc::new(AtomicUsize::new(0));
         let a = attempts.clone();
         let print_job: PrintJobFn = Arc::new(move |_ctx, _payload, _copies| {
-            a.fetch_add(1, Ordering::SeqCst);
-            JobOutcome::Failed(JobFailure::other("unsupported document"))
+            let a = a.clone();
+            Box::pin(async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                JobOutcome::Failed(JobFailure::other("unsupported document"))
+            })
         });
         let state = test_state(print_job, "fail");
         let job = state.jobs.create("p".into(), "tester".into());
         let id = job.id;
         spawn_print_worker(&state, "p".into(), job, vec![0], 1, "x".into());
 
-        assert_eq!(run_to_terminal(&state, id), JobState::Aborted);
+        assert_eq!(run_to_terminal(&state, id).await, JobState::Aborted);
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,
@@ -998,12 +1027,14 @@ mod tests {
     }
 
     /// Canceling a held job stops the retry loop promptly.
-    #[test]
-    fn canceling_a_held_job_stops_the_retries() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceling_a_held_job_stops_the_retries() {
         std::env::set_var("IPP_PRINTER_APP_RETRY_MS", "5");
         let print_job: PrintJobFn = Arc::new(|_ctx, _payload, _copies| {
             // Never recovers — only a cancel can end this.
-            JobOutcome::DeviceUnavailable { reasons: PrinterReason::MEDIA_JAM }
+            Box::pin(async {
+                JobOutcome::DeviceUnavailable { reasons: PrinterReason::MEDIA_JAM }
+            })
         });
         let state = test_state(print_job, "cancel");
         let job = state.jobs.create("p".into(), "tester".into());
@@ -1011,9 +1042,9 @@ mod tests {
         let cancel = job.cancel_flag.clone();
         spawn_print_worker(&state, "p".into(), job, vec![0], 1, "x".into());
         // Let it hold a couple of rounds, then cancel.
-        std::thread::sleep(Duration::from_millis(40));
+        tokio::time::sleep(Duration::from_millis(40)).await;
         state.jobs.cancel(id);
         let _ = cancel; // cancel() set the flag the worker polls
-        assert_eq!(run_to_terminal(&state, id), JobState::Canceled);
+        assert_eq!(run_to_terminal(&state, id).await, JobState::Canceled);
     }
 }

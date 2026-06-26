@@ -26,9 +26,14 @@ use parking_lot::RwLock;
 
 struct DemoBackend;
 
+#[async_trait::async_trait]
 impl DeviceBackend for DemoBackend {
-    fn list(&self, emit: &mut dyn FnMut(&str, &str, &str) -> bool) {
-        let _ = emit("Demo Printer", "demo://printer-1", "MFG:Demo;MDL:Test;");
+    async fn list(&self) -> Vec<ipp_printer_app::DiscoveredDevice> {
+        vec![ipp_printer_app::DiscoveredDevice {
+            info: "Demo Printer".into(),
+            uri: "demo://printer-1".into(),
+            device_id: "MFG:Demo;MDL:Test;".into(),
+        }]
     }
 
     fn driver_for_device(&self, _device_id: &str, device_uri: &str) -> Option<String> {
@@ -70,7 +75,7 @@ async fn main() -> std::io::Result<()> {
     let state_path = default_state_path("ipp-printer-app-demo");
     let backend = Arc::new(DemoBackend);
 
-    Server::bootstrap_printers(&registry, backend.as_ref(), &state_path, make_config);
+    Server::bootstrap_printers(&registry, backend.as_ref(), &state_path, make_config).await;
 
     Server::run(ServerOptions {
         host: "127.0.0.1".into(),
@@ -78,17 +83,19 @@ async fn main() -> std::io::Result<()> {
         printers: registry,
         device_backend: backend,
         print_job: Arc::new(|ctx, raster, copies| {
-            log::info!(
-                "demo: pretending to print job {} on {} ({} bytes, {} copies)",
-                ctx.id,
-                ctx.printer_name,
-                raster.len(),
-                copies
-            );
-            // A real device backend would return DeviceUnavailable when the
-            // hardware can't be reached (the framework then holds + retries the
-            // job) or Failed for a bad document. The demo always succeeds.
-            ipp_printer_app::JobOutcome::Completed
+            Box::pin(async move {
+                log::info!(
+                    "demo: pretending to print job {} on {} ({} bytes, {} copies)",
+                    ctx.id,
+                    ctx.printer_name,
+                    raster.len(),
+                    copies
+                );
+                // A real device backend would return DeviceUnavailable when the
+                // hardware can't be reached (the framework then holds + retries
+                // the job) or Failed for a bad document. The demo always succeeds.
+                ipp_printer_app::JobOutcome::Completed
+            })
         }),
         state_path,
         advertise_mdns: true,
