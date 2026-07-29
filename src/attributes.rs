@@ -395,7 +395,12 @@ pub fn get_printer_attributes(
             "media-col-default",
             media_col(media_kws[0], default_size),
         );
-        let media_cols: Vec<IppValue> = media_kws
+        // Pair each enumerated name with its own size, then append the custom
+        // bookends carrying *their* bounds. Zipping the whole keyword list
+        // against the size list would run the bookends past the end and give
+        // them the default size, contradicting the dimensions in their names.
+        let mut media_cols: Vec<IppValue> = cfg
+            .media_names
             .iter()
             .zip(
                 cfg.media_sizes
@@ -405,6 +410,10 @@ pub fn get_printer_attributes(
             )
             .map(|(name, size)| media_col(name, size))
             .collect();
+        if let Some((min, max)) = custom_range {
+            media_cols.push(media_col(&custom_media_name("min", min), min));
+            media_cols.push(media_col(&custom_media_name("max", max), max));
+        }
         // PWG 5100.13: `media-col-supported` is `1setOf keyword` naming the
         // member attributes a client may set in a `media-col` collection — NOT
         // the collections themselves (that's `media-col-database`, which CUPS'
@@ -993,6 +1002,70 @@ mod tests {
                 "{min:?}..{max:?} should be rejected"
             );
         }
+    }
+
+    /// Look up one printer attribute by name.
+    fn printer_attr(cfg: PrinterConfig, name: &str) -> IppValue {
+        let record = PrinterRecord::new(cfg);
+        let resp = get_printer_attributes(IppVersion::v2_0(), 1, &record, "localhost", 8631, None)
+            .unwrap();
+        let value = resp
+            .attributes()
+            .groups_of(DelimiterTag::PrinterAttributes)
+            .flat_map(|g| g.attributes().values())
+            .find(|a| a.name().as_ref() == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+            .value()
+            .clone();
+        value
+    }
+
+    /// The x-dimension of the `media-col` entry carrying `size_name`.
+    fn x_dimension_of(db: &IppValue, size_name: &str) -> Option<i32> {
+        db.into_iter().find_map(|entry| {
+            let IppValue::Collection(col) = entry else {
+                return None;
+            };
+            let named = col
+                .iter()
+                .any(|(k, v)| k.as_ref() == "media-size-name" && v.to_string() == size_name);
+            if !named {
+                return None;
+            }
+            let IppValue::Collection(size) =
+                col.iter().find(|(k, _)| k.as_ref() == "media-size")?.1
+            else {
+                return None;
+            };
+            match size.iter().find(|(k, _)| k.as_ref() == "x-dimension")?.1 {
+                IppValue::Integer(v) => Some(*v),
+                _ => None,
+            }
+        })
+    }
+
+    /// Each custom bookend must carry its own bounds in media-col-database.
+    /// Zipping the full keyword list against the size list ran them past the
+    /// end of the size list and handed them the default, so the collection
+    /// contradicted the dimensions in the name beside it.
+    #[test]
+    fn custom_bookends_carry_their_own_size() {
+        let db = printer_attr(
+            config_with_range([1000, 1000], [5000, 12000]),
+            "media-col-database",
+        );
+        assert_eq!(
+            x_dimension_of(&db, "custom_min_10x10mm_10x10mm"),
+            Some(1000),
+            "min bookend not paired with its own size"
+        );
+        assert_eq!(
+            x_dimension_of(&db, "custom_max_50x120mm_50x120mm"),
+            Some(5000),
+            "max bookend not paired with its own size"
+        );
+        // The enumerated entry must be untouched by the change.
+        assert_eq!(x_dimension_of(&db, "om_40x30mm_40x30mm"), Some(4000));
     }
 
     #[test]

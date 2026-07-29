@@ -32,5 +32,7 @@ pub use flags::PrinterReason;
 pub use job::{JobId, JobRecord, JobRegistry, JobState};
 pub use printer::{PrinterConfig, PrinterHandle, PrinterRecord, PrinterRegistry};
 pub use raster::{JobFailure, JobOptions, JobOutcome, RasterDriver};
-pub use server::{JobContext, PrintJobFn, PrintJobFuture, Server, ServerOptions};
+pub use server::{
+    JobContext, MediaChangeFn, MediaChangeFuture, PrintJobFn, PrintJobFuture, Server, ServerOptions,
+};
 pub use state::{default_state_path, PersistedState};
