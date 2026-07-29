@@ -37,7 +37,9 @@ impl DeviceBackend for DemoBackend {
     }
 
     fn driver_for_device(&self, _device_id: &str, device_uri: &str) -> Option<String> {
-        device_uri.starts_with("demo://").then(|| "demo".to_string())
+        device_uri
+            .starts_with("demo://")
+            .then(|| "demo".to_string())
     }
 }
 

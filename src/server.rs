@@ -4,18 +4,6 @@ use std::io::{Cursor, Read};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::Router;
-use ipp::model::Operation;
-use ipp::parser::IppParser;
-use ipp::model::StatusCode as IppStatus;
-use ipp::prelude::*;
-use ipp::reader::IppReader;
-use num_traits::FromPrimitive;
 use crate::attributes::{
     self, build_get_jobs_response, build_job_attrs_response, get_printer_attributes,
     print_job_accepted, validate_job,
@@ -25,6 +13,18 @@ use crate::job::{JobId, JobRegistry, JobState};
 use crate::printer::{PrinterRecord, PrinterRegistry};
 use crate::raster::JobOutcome;
 use crate::state::PersistedState;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::Router;
+use ipp::model::Operation;
+use ipp::model::StatusCode as IppStatus;
+use ipp::parser::IppParser;
+use ipp::prelude::*;
+use ipp::reader::IppReader;
+use num_traits::FromPrimitive;
 
 /// Context passed to a print-job worker so it can observe cancellation and
 /// report progress without re-querying the registry.
@@ -205,11 +205,7 @@ impl Server {
     /// at the end of every print job; expose for callers that want to
     /// persist after manual registry edits.
     pub fn persist(registry: &PrinterRegistry, state_path: &std::path::Path) {
-        let configs: Vec<_> = registry
-            .read()
-            .iter()
-            .map(|r| r.config.clone())
-            .collect();
+        let configs: Vec<_> = registry.read().iter().map(|r| r.config.clone()).collect();
         let _ = PersistedState { printers: configs }.save(state_path);
     }
 }
@@ -271,7 +267,11 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
         },
         state.port,
     ));
-    (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
 }
 
 /// Serve the printer icon advertised in `printer-icons`. A 1×1 transparent
@@ -342,12 +342,9 @@ async fn handle_ipp(
     // order), so we check the first two names against the raw request bytes.
     // Wrong order / missing → `client-error-bad-request`.
     if !operation_attributes_well_ordered(body) {
-        let resp = IppRequestResponse::new_response(
-            version,
-            IppStatus::ClientErrorBadRequest,
-            request_id,
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let resp =
+            IppRequestResponse::new_response(version, IppStatus::ClientErrorBadRequest, request_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(resp.to_bytes().to_vec());
     }
 
@@ -355,12 +352,9 @@ async fn handle_ipp(
     // `client-error-bad-request`. We answer in-band (HTTP 200 + IPP status) so
     // conformant clients see the IPP error rather than a transport failure.
     if request_id == 0 {
-        let resp = IppRequestResponse::new_response(
-            version,
-            IppStatus::ClientErrorBadRequest,
-            request_id,
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let resp =
+            IppRequestResponse::new_response(version, IppStatus::ClientErrorBadRequest, request_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(resp.to_bytes().to_vec());
     }
 
@@ -368,12 +362,9 @@ async fn handle_ipp(
     // `printer-uri` (or `job-uri`) operation attribute. We still route by the
     // request path, but a request carrying neither is malformed.
     if !has_operation_attr(&req, "printer-uri") && !has_operation_attr(&req, "job-uri") {
-        let resp = IppRequestResponse::new_response(
-            version,
-            IppStatus::ClientErrorBadRequest,
-            request_id,
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let resp =
+            IppRequestResponse::new_response(version, IppStatus::ClientErrorBadRequest, request_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(resp.to_bytes().to_vec());
     }
 
@@ -442,8 +433,10 @@ async fn handle_ipp(
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         }
-        Operation::ValidateJob => validate_job(version, request_id, &record, &state.host, state.port)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        Operation::ValidateJob => {
+            validate_job(version, request_id, &record, &state.host, state.port)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
         Operation::PrintJob => {
             let copies = extract_copies(&req);
             let format = extract_document_format(&req);
@@ -487,10 +480,10 @@ async fn handle_ipp(
                 StatusCode::BAD_REQUEST,
                 "Send-Document missing job-id".to_string(),
             ))?;
-            let job = state.jobs.get(job_id).ok_or((
-                StatusCode::NOT_FOUND,
-                format!("job not found: {job_id}"),
-            ))?;
+            let job = state
+                .jobs
+                .get(job_id)
+                .ok_or((StatusCode::NOT_FOUND, format!("job not found: {job_id}")))?;
             let copies = extract_copies(&req);
             let format = extract_document_format(&req);
             let mut payload = Vec::new();
@@ -499,7 +492,14 @@ async fn handle_ipp(
                 .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
             if !payload.is_empty() {
-                spawn_print_worker(state, name.to_string(), job.clone(), payload, copies, format);
+                spawn_print_worker(
+                    state,
+                    name.to_string(),
+                    job.clone(),
+                    payload,
+                    copies,
+                    format,
+                );
             }
             let printer_uri_str = record.config.printer_uri(&state.host, state.port);
             build_job_attrs_response(version, request_id, &job, &printer_uri_str, None)
@@ -530,10 +530,10 @@ async fn handle_ipp(
                 StatusCode::BAD_REQUEST,
                 "Get-Job-Attributes missing job-id".to_string(),
             ))?;
-            let job = state.jobs.get(job_id).ok_or((
-                StatusCode::NOT_FOUND,
-                format!("job not found: {job_id}"),
-            ))?;
+            let job = state
+                .jobs
+                .get(job_id)
+                .ok_or((StatusCode::NOT_FOUND, format!("job not found: {job_id}")))?;
             // Get-Job-Attributes default is "all" — filter only when the
             // client supplies a concrete `requested-attributes` set.
             let requested = extract_requested_attributes(&req);
@@ -665,7 +665,9 @@ fn extract_document_format(req: &IppRequestResponse) -> String {
 
 /// Collect the client's `requested-attributes` values (RFC 8011 §4.2.5).
 /// Returns `None` when the attribute is absent (caller treats that as "all").
-fn extract_requested_attributes(req: &IppRequestResponse) -> Option<std::collections::BTreeSet<String>> {
+fn extract_requested_attributes(
+    req: &IppRequestResponse,
+) -> Option<std::collections::BTreeSet<String>> {
     for group in req.attributes().groups() {
         for attr in group.attributes().values() {
             if attr.name().as_str() == "requested-attributes" {
@@ -802,22 +804,32 @@ fn spawn_print_worker(
             }
             match (state_clone.print_job)(ctx.clone(), payload.clone(), copies).await {
                 JobOutcome::Completed => {
-                    set_printer_reasons(&state_clone, &name_owned, crate::flags::PrinterReason::empty());
+                    set_printer_reasons(
+                        &state_clone,
+                        &name_owned,
+                        crate::flags::PrinterReason::empty(),
+                    );
                     set_printer_idle_named(&state_clone, &name_owned);
                     // Don't clobber a Cancel that landed mid-print.
                     if !ctx.is_canceled() {
-                        state_clone.jobs.set_state(job_for_worker.id, JobState::Completed);
+                        state_clone
+                            .jobs
+                            .set_state(job_for_worker.id, JobState::Completed);
                     }
                     break;
                 }
                 JobOutcome::Failed(f) => {
                     log::error!(
                         "print job {} failed: {} (reasons={:?})",
-                        job_for_worker.id, f.message, f.printer_reasons
+                        job_for_worker.id,
+                        f.message,
+                        f.printer_reasons
                     );
                     set_printer_reasons(&state_clone, &name_owned, f.printer_reasons);
                     set_printer_idle_named(&state_clone, &name_owned);
-                    state_clone.jobs.set_failure(job_for_worker.id, f.printer_reasons, f.message);
+                    state_clone
+                        .jobs
+                        .set_failure(job_for_worker.id, f.printer_reasons, f.message);
                     break;
                 }
                 JobOutcome::DeviceUnavailable { reasons } => {
@@ -830,7 +842,9 @@ fn spawn_print_worker(
                     }
                     // Surface the condition but keep printer-state Processing.
                     set_printer_reasons(&state_clone, &name_owned, reasons);
-                    state_clone.jobs.set_state(job_for_worker.id, JobState::ProcessingStopped);
+                    state_clone
+                        .jobs
+                        .set_state(job_for_worker.id, JobState::ProcessingStopped);
                     if sleep_cancelable(&ctx.cancel_flag, backoff).await {
                         break; // canceled during the wait
                     }
@@ -841,7 +855,11 @@ fn spawn_print_worker(
 
         if ctx.is_canceled() {
             // Reflect the cancel and clear any held condition.
-            set_printer_reasons(&state_clone, &name_owned, crate::flags::PrinterReason::empty());
+            set_printer_reasons(
+                &state_clone,
+                &name_owned,
+                crate::flags::PrinterReason::empty(),
+            );
             set_printer_idle_named(&state_clone, &name_owned);
             state_clone.jobs.cancel(job_for_worker.id);
         }
@@ -905,7 +923,10 @@ mod tests {
             "supvan_t50_series_t0117a2410211517"
         );
         // Collapses runs of separators and trims leading/trailing ones.
-        assert_eq!(printer_name_from_uri("", "  Brother  HL-2270DW  "), "brother_hl_2270dw");
+        assert_eq!(
+            printer_name_from_uri("", "  Brother  HL-2270DW  "),
+            "brother_hl_2270dw"
+        );
         // Falls back to the URI when info is empty, and never yields empty.
         assert_eq!(printer_name_from_uri("supvan://t0117", ""), "supvan_t0117");
         assert_eq!(printer_name_from_uri("", "***"), "printer");
@@ -941,7 +962,9 @@ mod tests {
 
     fn test_state(print_job: PrintJobFn, tag: &str) -> AppState {
         let registry: PrinterRegistry =
-            Arc::new(parking_lot::RwLock::new(vec![PrinterRecord::new(test_config("p"))]));
+            Arc::new(parking_lot::RwLock::new(vec![PrinterRecord::new(
+                test_config("p"),
+            )]));
         AppState {
             host: "127.0.0.1".into(),
             port: 0,
@@ -958,7 +981,10 @@ mod tests {
     async fn run_to_terminal(state: &AppState, id: crate::job::JobId) -> JobState {
         for _ in 0..500 {
             let s = state.jobs.get(id).unwrap().state;
-            if matches!(s, JobState::Completed | JobState::Aborted | JobState::Canceled) {
+            if matches!(
+                s,
+                JobState::Completed | JobState::Aborted | JobState::Canceled
+            ) {
                 return s;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -978,7 +1004,9 @@ mod tests {
             Box::pin(async move {
                 // Unavailable for the first two attempts, then it prints.
                 if a.fetch_add(1, Ordering::SeqCst) < 2 {
-                    JobOutcome::DeviceUnavailable { reasons: PrinterReason::OFFLINE }
+                    JobOutcome::DeviceUnavailable {
+                        reasons: PrinterReason::OFFLINE,
+                    }
                 } else {
                     JobOutcome::Completed
                 }
@@ -987,7 +1015,14 @@ mod tests {
         let state = test_state(print_job, "hold");
         let job = state.jobs.create("p".into(), "tester".into());
         let id = job.id;
-        spawn_print_worker(&state, "p".into(), job, vec![1, 2, 3], 1, "image/pwg-raster".into());
+        spawn_print_worker(
+            &state,
+            "p".into(),
+            job,
+            vec![1, 2, 3],
+            1,
+            "image/pwg-raster".into(),
+        );
 
         assert_eq!(
             run_to_terminal(&state, id).await,
@@ -1033,7 +1068,9 @@ mod tests {
         let print_job: PrintJobFn = Arc::new(|_ctx, _payload, _copies| {
             // Never recovers — only a cancel can end this.
             Box::pin(async {
-                JobOutcome::DeviceUnavailable { reasons: PrinterReason::MEDIA_JAM }
+                JobOutcome::DeviceUnavailable {
+                    reasons: PrinterReason::MEDIA_JAM,
+                }
             })
         });
         let state = test_state(print_job, "cancel");

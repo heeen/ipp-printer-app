@@ -27,9 +27,8 @@ const IPP_SERVICE: &str = "_ipp._tcp.local.";
 /// duplicate queue. Restricting the advert to real interfaces removes those
 /// resolves at the source. (Plain `br0`/`tun0` are *not* matched — only the
 /// `br-`/container-style names — so genuine LAN bridges still advertise.)
-const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
-    "veth", "docker", "br-", "virbr", "vnet", "vmnet", "vboxnet",
-];
+const VIRTUAL_IFACE_PREFIXES: &[&str] =
+    &["veth", "docker", "br-", "virbr", "vnet", "vmnet", "vboxnet"];
 
 /// Owns the [`ServiceDaemon`] and the bind-time host/addresses, and tracks the
 /// DNS-SD fullname registered for each printer so individual services can be
@@ -74,7 +73,9 @@ impl Advertiser {
         let fullname = info.get_fullname().to_string();
         self.daemon.register(info)?;
         log::info!("mdns: registered {fullname}");
-        self.registered.lock().insert(rec.config.name.clone(), fullname);
+        self.registered
+            .lock()
+            .insert(rec.config.name.clone(), fullname);
         Ok(())
     }
 }
@@ -112,9 +113,7 @@ impl Drop for Advertiser {
 /// Whether `name` looks like a container/VM virtual bridge or veth interface
 /// we must not advertise on (see [`VIRTUAL_IFACE_PREFIXES`]).
 fn is_virtual_iface(name: &str) -> bool {
-    VIRTUAL_IFACE_PREFIXES
-        .iter()
-        .any(|p| name.starts_with(p))
+    VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// The host addresses to advertise on: every up, non-loopback, non-link-local
@@ -137,7 +136,11 @@ fn advertise_addrs() -> Vec<IpAddr> {
             continue;
         }
         if is_virtual_iface(&iface.name) {
-            log::debug!("mdns: skipping virtual interface {} ({})", iface.name, iface.ip());
+            log::debug!(
+                "mdns: skipping virtual interface {} ({})",
+                iface.name,
+                iface.ip()
+            );
             continue;
         }
         log::debug!("mdns: advertising on {} ({})", iface.name, iface.ip());

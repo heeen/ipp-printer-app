@@ -40,10 +40,7 @@ pub struct JobFailure {
 
 impl JobFailure {
     /// Build a failure with explicit `printer-state-reasons`.
-    pub fn new(
-        printer_reasons: crate::flags::PrinterReason,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn new(printer_reasons: crate::flags::PrinterReason, message: impl Into<String>) -> Self {
         Self {
             printer_reasons,
             message: message.into(),
@@ -134,12 +131,7 @@ pub trait RasterDriver: Sized + Send + 'static {
     }
 
     /// Append one scanline to the page buffer.
-    fn write_line(
-        &mut self,
-        options: &JobOptions,
-        y: u32,
-        line: &[u8],
-    ) -> Result<(), JobFailure>;
+    fn write_line(&mut self, options: &JobOptions, y: u32, line: &[u8]) -> Result<(), JobFailure>;
 
     /// Transfer the completed page to the device (and repeat for copies).
     async fn end_page(

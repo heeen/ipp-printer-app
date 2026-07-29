@@ -200,7 +200,10 @@ async fn new_device_added_alongside_existing() {
 
     let records = registry.read();
     assert_eq!(records.len(), 2);
-    let uris: Vec<&str> = records.iter().map(|r| r.config.device_uri.as_str()).collect();
+    let uris: Vec<&str> = records
+        .iter()
+        .map(|r| r.config.device_uri.as_str())
+        .collect();
     assert!(uris.contains(&"usbhid://bus-5-2"));
     assert!(uris.contains(&"btrfcomm://hci0/AA:BB:CC:DD:EE:FF"));
 

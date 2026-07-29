@@ -214,9 +214,13 @@ mod tests {
     // block_in_place inside poll_once needs a multi-threaded runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offline_stops_and_withdraws_then_recovery_republishes() {
-        let backend = FakeBackend { reasons: Mutex::new(PrinterReason::OFFLINE) };
+        let backend = FakeBackend {
+            reasons: Mutex::new(PrinterReason::OFFLINE),
+        };
         let registry: PrinterRegistry =
-            Arc::new(parking_lot::RwLock::new(vec![PrinterRecord::new(config("p"))]));
+            Arc::new(parking_lot::RwLock::new(vec![PrinterRecord::new(config(
+                "p",
+            ))]));
         let adv = Arc::new(FakeAdvertiser::default());
         // Simulate startup register_all having advertised it.
         adv.publish(&registry.read()[0].clone());
@@ -231,7 +235,10 @@ mod tests {
         *backend.reasons.lock() = PrinterReason::empty();
         poll_once(&backend, &registry, Some(advref)).await;
         assert_eq!(registry.read()[0].state, IppPrinterState::Idle);
-        assert!(adv.is_advertised("p"), "recovered printer must be republished");
+        assert!(
+            adv.is_advertised("p"),
+            "recovered printer must be republished"
+        );
     }
 
     /// The advert is reconciled, not edge-triggered: a held job that drove the
@@ -240,9 +247,13 @@ mod tests {
     /// Idle edge.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_republishes_without_a_state_edge() {
-        let backend = FakeBackend { reasons: Mutex::new(PrinterReason::empty()) };
+        let backend = FakeBackend {
+            reasons: Mutex::new(PrinterReason::empty()),
+        };
         let registry: PrinterRegistry =
-            Arc::new(parking_lot::RwLock::new(vec![PrinterRecord::new(config("p"))]));
+            Arc::new(parking_lot::RwLock::new(vec![PrinterRecord::new(config(
+                "p",
+            ))]));
         // Already Idle (the worker reset it after a held job finished printing),
         // but the advert was never restored.
         let adv = Arc::new(FakeAdvertiser::default());

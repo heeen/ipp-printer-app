@@ -30,9 +30,10 @@ fn parse_get_printer_attributes_roundtrip() {
     .unwrap();
     let bytes = req.to_bytes();
 
-    let parsed = ipp::parser::IppParser::new(ipp::reader::IppReader::new(Cursor::new(bytes.to_vec())))
-        .parse()
-        .expect("parse");
+    let parsed =
+        ipp::parser::IppParser::new(ipp::reader::IppReader::new(Cursor::new(bytes.to_vec())))
+            .parse()
+            .expect("parse");
     assert_eq!(
         parsed.header().operation_or_status,
         Operation::GetPrinterAttributes as u16

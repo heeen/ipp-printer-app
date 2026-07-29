@@ -62,7 +62,10 @@ impl PrinterReason {
             (Self::SPOOL_AREA_FULL, "spool-area-full"),
             (Self::TONER_EMPTY, "toner-empty"),
             (Self::TONER_LOW, "toner-low"),
-            (Self::IDENTIFY_PRINTER_REQUESTED, "identify-printer-requested"),
+            (
+                Self::IDENTIFY_PRINTER_REQUESTED,
+                "identify-printer-requested",
+            ),
         ];
         table
             .into_iter()

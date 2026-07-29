@@ -19,9 +19,9 @@ pub mod attributes;
 pub mod device;
 pub mod flags;
 pub mod job;
-pub mod printer;
 #[cfg(feature = "mdns")]
 pub mod mdns;
+pub mod printer;
 pub mod raster;
 pub mod server;
 pub mod state;
