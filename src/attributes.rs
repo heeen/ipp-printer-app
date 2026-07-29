@@ -362,7 +362,27 @@ pub fn get_printer_attributes(
         }]),
     );
 
-    let media_kws: Vec<&str> = cfg.media_names.iter().map(|s| s.as_str()).collect();
+    // PWG 5101.1 custom-size bookends. Advertising these alongside the
+    // enumerated names is what makes a desktop dialog offer a Custom entry;
+    // without them a client can only pick from the fixed list.
+    let custom_range = custom_media_range(cfg);
+    let custom_kws: Vec<String> = custom_range
+        .iter()
+        .flat_map(|(min, max)| {
+            [
+                custom_media_name("min", *min),
+                custom_media_name("max", *max),
+            ]
+        })
+        .collect();
+
+    let media_kws: Vec<&str> = cfg
+        .media_names
+        .iter()
+        .map(|s| s.as_str())
+        .chain(custom_kws.iter().map(|s| s.as_str()))
+        .collect();
+
     if !media_kws.is_empty() {
         add(attrs, p, "media-default", kw(media_kws[0]));
         add_array_keyword(attrs, p, "media-supported", &media_kws);
@@ -413,16 +433,19 @@ pub fn get_printer_attributes(
 
         // `media-size-supported` (PWG 5100.12 §6.3.x): `1setOf collection` of
         // bare `media-size` (x/y only), distinct from `media-col-database`.
-        let media_sizes: Vec<IppValue> = media_kws
+        let mut media_sizes: Vec<IppValue> = cfg
+            .media_sizes
             .iter()
-            .zip(
-                cfg.media_sizes
-                    .iter()
-                    .copied()
-                    .chain(std::iter::repeat(default_size)),
-            )
-            .map(|(_, size)| media_size_col(size))
+            .copied()
+            .map(media_size_col)
             .collect();
+        // A range entry alongside the discrete ones: PWG 5100.12 allows
+        // x/y-dimension to be a rangeOfInteger, which is how a printer says
+        // "anything between these bounds", and how CUPS derives its Custom
+        // page-size support.
+        if let Some((min, max)) = custom_range {
+            media_sizes.push(media_size_range_col(min, max));
+        }
         add(
             attrs,
             p,
@@ -836,6 +859,49 @@ fn media_col(name: &str, size_hmm: [i32; 2]) -> IppValue {
     IppValue::Collection(col)
 }
 
+/// The configured custom-size bounds, if the printer advertises any.
+///
+/// Both ends must be non-zero and `max` must not be under `min` — a half-filled
+/// or inverted range would otherwise emit an attribute clients can't satisfy.
+fn custom_media_range(cfg: &crate::printer::PrinterConfig) -> Option<([i32; 2], [i32; 2])> {
+    let (min, max) = (cfg.media_size_min, cfg.media_size_max);
+    let sane = min.iter().all(|&v| v > 0)
+        && max.iter().all(|&v| v > 0)
+        && max[0] >= min[0]
+        && max[1] >= min[1];
+    sane.then_some((min, max))
+}
+
+/// PWG 5101.1 self-describing name for a custom-size bookend, e.g.
+/// `custom_min_10x10mm_10x10mm`. Metric takes the `custom_` class with `mm`
+/// units; dimensions are hundredths of a millimetre internally.
+fn custom_media_name(bound: &str, size_hmm: [i32; 2]) -> String {
+    let (w, h) = (size_hmm[0] / 100, size_hmm[1] / 100);
+    format!("custom_{bound}_{w}x{h}mm_{w}x{h}mm")
+}
+
+/// Build a `media-size` collection whose dimensions are ranges rather than
+/// fixed integers — the "any size between these" form.
+fn media_size_range_col(min_hmm: [i32; 2], max_hmm: [i32; 2]) -> IppValue {
+    use std::collections::BTreeMap;
+    let mut size = BTreeMap::new();
+    size.insert(
+        "x-dimension".try_into().unwrap(),
+        IppValue::RangeOfInteger {
+            min: min_hmm[0],
+            max: max_hmm[0],
+        },
+    );
+    size.insert(
+        "y-dimension".try_into().unwrap(),
+        IppValue::RangeOfInteger {
+            min: min_hmm[1],
+            max: max_hmm[1],
+        },
+    );
+    IppValue::Collection(size)
+}
+
 /// Build a bare `media-size` collection (x/y dimensions only) for
 /// `media-size-supported`.
 fn media_size_col(size_hmm: [i32; 2]) -> IppValue {
@@ -857,4 +923,83 @@ fn uptime_secs() -> u64 {
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::printer::{PrinterConfig, PrinterRecord};
+
+    fn config_with_range(min: [i32; 2], max: [i32; 2]) -> PrinterConfig {
+        PrinterConfig {
+            name: "p".into(),
+            display_name: String::new(),
+            driver_name: "t".into(),
+            make_and_model: "Test".into(),
+            device_id: String::new(),
+            device_uri: "mock://x".into(),
+            dpi: 203,
+            printhead_width_dots: 384,
+            media_names: vec!["om_40x30mm_40x30mm".into()],
+            media_sizes: vec![[4000, 3000]],
+            media_size_min: min,
+            media_size_max: max,
+            darkness: 50,
+            document_formats: vec![],
+        }
+    }
+
+    fn attrs_text(cfg: PrinterConfig) -> String {
+        let record = PrinterRecord::new(cfg);
+        let resp = get_printer_attributes(IppVersion::v2_0(), 1, &record, "localhost", 8631, None)
+            .unwrap();
+        format!("{:?}", resp.attributes())
+    }
+
+    /// Bounds set: the range entry and both PWG bookend names must appear, or a
+    /// desktop dialog has no way to offer a Custom size.
+    #[test]
+    fn custom_range_is_advertised_when_bounds_set() {
+        let text = attrs_text(config_with_range([1000, 1000], [5000, 12000]));
+        assert!(text.contains("custom_min_10x10mm"), "min bookend missing");
+        assert!(text.contains("custom_max_50x120mm"), "max bookend missing");
+        assert!(
+            text.contains("RangeOfInteger"),
+            "media-size-supported has no range entry"
+        );
+    }
+
+    /// Unset bounds must leave the attribute set exactly as before — a printer
+    /// with fixed media should not suddenly claim custom support.
+    #[test]
+    fn no_custom_range_when_bounds_unset() {
+        let text = attrs_text(config_with_range([0, 0], [0, 0]));
+        assert!(!text.contains("custom_min"));
+        assert!(!text.contains("custom_max"));
+    }
+
+    /// Half-filled or inverted bounds are rejected rather than emitted, since a
+    /// client cannot satisfy a range whose max is below its min.
+    #[test]
+    fn malformed_bounds_are_ignored() {
+        for (min, max) in [
+            ([1000, 1000], [0, 0]),
+            ([0, 0], [5000, 5000]),
+            ([5000, 5000], [1000, 1000]),
+            ([1000, 6000], [5000, 5000]),
+        ] {
+            assert!(
+                custom_media_range(&config_with_range(min, max)).is_none(),
+                "{min:?}..{max:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_name_uses_pwg_metric_form() {
+        assert_eq!(
+            custom_media_name("min", [1000, 1500]),
+            "custom_min_10x15mm_10x15mm"
+        );
+    }
 }

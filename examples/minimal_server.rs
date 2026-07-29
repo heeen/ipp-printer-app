@@ -61,6 +61,8 @@ fn make_config(
         printhead_width_dots: 384,
         media_names: vec!["om_30x20mm_30x20mm".into()],
         media_sizes: vec![[3000, 2000]],
+        media_size_min: [1000, 1000],
+        media_size_max: [5000, 12000],
         darkness: 50,
         document_formats: Vec::new(),
     })

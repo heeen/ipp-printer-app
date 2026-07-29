@@ -955,6 +955,8 @@ mod tests {
             printhead_width_dots: 384,
             media_names: vec![],
             media_sizes: vec![],
+            media_size_min: [0, 0],
+            media_size_max: [0, 0],
             darkness: 50,
             document_formats: vec![],
         }

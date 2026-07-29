@@ -33,6 +33,19 @@ pub struct PrinterConfig {
     pub printhead_width_dots: u32,
     pub media_names: Vec<String>,
     pub media_sizes: Vec<[i32; 2]>,
+    /// Smallest and largest custom media the printer accepts, `[x, y]` in
+    /// hundredths of a millimetre.
+    ///
+    /// When both are non-zero, `media-size-supported` gains a range entry and
+    /// the PWG `custom_min_*` / `custom_max_*` names join `media-supported` —
+    /// which is what makes a desktop print dialog offer a Custom size rather
+    /// than only the enumerated list. Leave either zeroed to advertise fixed
+    /// sizes only. `#[serde(default)]` so state written before this existed
+    /// still loads.
+    #[serde(default)]
+    pub media_size_min: [i32; 2],
+    #[serde(default)]
+    pub media_size_max: [i32; 2],
     /// Darkness 0–100 (maps to print density).
     pub darkness: i32,
     /// MIME types the consumer's print callback can decode, emitted as
