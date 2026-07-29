@@ -101,6 +101,9 @@ async fn main() -> std::io::Result<()> {
                 ipp_printer_app::JobOutcome::Completed
             })
         }),
+        // The demo has no device to consult, so every media change is accepted.
+        // A real consumer refuses here when the hardware can't honour the size.
+        media_change: None,
         state_path,
         advertise_mdns: true,
     })

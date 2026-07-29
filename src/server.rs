@@ -14,6 +14,7 @@ use crate::printer::{PrinterRecord, PrinterRegistry};
 use crate::raster::JobOutcome;
 use crate::state::PersistedState;
 use axum::body::Bytes;
+use axum::extract::Form;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
@@ -70,6 +71,23 @@ pub type PrintJobFuture =
 /// The framework drives spooling/retry around it.
 pub type PrintJobFn = Arc<dyn Fn(JobContext, Arc<[u8]>, u32) -> PrintJobFuture + Send + Sync>;
 
+/// Boxed, owned future a [`MediaChangeFn`] returns.
+pub type MediaChangeFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+/// Called when an operator sets the loaded media from the web UI, **before**
+/// the change is written to the config.
+///
+/// Returning `Err(reason)` refuses the change: the config is left untouched and
+/// the page shows the reason. That matters because the consumer is the only
+/// party that knows whether the device will accept it — a printer whose media
+/// is described by an RFID tag, for instance, must not have that tag's geometry
+/// contradicted by a hand-entered size.
+///
+/// Given the printer's logical name and the requested media.
+pub type MediaChangeFn =
+    Arc<dyn Fn(String, crate::device::ReadyMedia) -> MediaChangeFuture + Send + Sync>;
+
 /// Server configuration. Construct in your `main`, hand to [`Server::run`].
 #[allow(missing_docs)]
 pub struct ServerOptions {
@@ -78,6 +96,9 @@ pub struct ServerOptions {
     pub printers: PrinterRegistry,
     pub device_backend: Arc<dyn DeviceBackend>,
     pub print_job: PrintJobFn,
+    /// Optional hook invoked when an operator sets the loaded media from the
+    /// web UI. `None` accepts every change without consulting the device.
+    pub media_change: Option<MediaChangeFn>,
     pub state_path: std::path::PathBuf,
     /// When `true` (and the `mdns` feature is on), [`Server::run`] starts the
     /// DNS-SD advertiser itself, immediately, from the registry as it stands
@@ -99,6 +120,7 @@ pub struct AppState {
     pub port: u16,
     pub printers: PrinterRegistry,
     pub print_job: PrintJobFn,
+    pub media_change: Option<MediaChangeFn>,
     pub state_path: std::path::PathBuf,
     pub jobs: JobRegistry,
     pub device_backend: Arc<dyn DeviceBackend>,
@@ -116,6 +138,7 @@ impl Server {
             port: opts.port,
             printers: opts.printers.clone(),
             print_job: opts.print_job,
+            media_change: opts.media_change,
             state_path: opts.state_path,
             jobs: JobRegistry::new(),
             device_backend: opts.device_backend,
@@ -124,6 +147,10 @@ impl Server {
         Router::new()
             .route("/", get(index_handler))
             .route("/icon.png", get(icon_handler))
+            .route(
+                "/media/{name}",
+                get(media_form_handler).post(media_apply_handler),
+            )
             .route("/ipp/print/{name}", post(ipp_handler))
             .route("/ipp/print/{name}/", post(ipp_handler))
             .with_state(state)
@@ -242,6 +269,180 @@ fn printer_name_from_uri(uri: &str, info: &str) -> String {
     }
 }
 
+/// Escape the few characters that would let a config value break out of the
+/// HTML we build by hand.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Operator-entered media geometry, in whole millimetres — the unit printed on
+/// the roll, rather than the hundredths the protocol uses.
+#[derive(serde::Deserialize)]
+struct MediaForm {
+    width_mm: u32,
+    height_mm: u32,
+}
+
+/// The media a printer currently reports, in millimetres, preferring live
+/// device data over the configured default.
+fn current_media_mm(record: &PrinterRecord) -> (u32, u32) {
+    let hmm = match &record.ready_media {
+        Some(rm) => rm.size_hmm,
+        None => record
+            .config
+            .media_sizes
+            .first()
+            .copied()
+            .unwrap_or([4000, 3000]),
+    };
+    ((hmm[0] / 100) as u32, (hmm[1] / 100) as u32)
+}
+
+fn media_page(record: &PrinterRecord, message: Option<&str>, is_error: bool) -> String {
+    let cfg = &record.config;
+    let (w, h) = current_media_mm(record);
+    let bounds = if cfg.media_size_min.iter().all(|&v| v > 0) {
+        format!(
+            "<p>Accepts {}×{}mm to {}×{}mm.</p>",
+            cfg.media_size_min[0] / 100,
+            cfg.media_size_min[1] / 100,
+            cfg.media_size_max[0] / 100,
+            cfg.media_size_max[1] / 100,
+        )
+    } else {
+        String::new()
+    };
+    let banner = match message {
+        Some(m) if is_error => format!("<p style=\"color:#b00\"><b>{}</b></p>", esc(m)),
+        Some(m) => format!("<p style=\"color:#070\">{}</p>", esc(m)),
+        None => String::new(),
+    };
+    format!(
+        "<!DOCTYPE html><html><head><title>Media — {name}</title></head><body>\
+         <h1>Loaded media</h1><h2>{label}</h2>{banner}{bounds}\
+         <form method=\"post\">\
+         <label>Width <input name=\"width_mm\" type=\"number\" min=\"1\" value=\"{w}\"></label> mm<br>\
+         <label>Length <input name=\"height_mm\" type=\"number\" min=\"1\" value=\"{h}\"></label> mm<br>\
+         <button type=\"submit\">Set</button></form>\
+         <p><a href=\"/\">Back</a></p></body></html>",
+        name = esc(&cfg.name),
+        label = esc(cfg.display_label()),
+    )
+}
+
+async fn media_form_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let printers = state.printers.read();
+    match printers.iter().find(|p| p.config.name == name) {
+        Some(record) => (
+            StatusCode::OK,
+            axum::response::Html(media_page(record, None, false)),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::response::Html("<p>No such printer.</p>".to_string()),
+        ),
+    }
+}
+
+async fn media_apply_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Form(form): Form<MediaForm>,
+) -> impl IntoResponse {
+    // Snapshot rather than holding the lock: the hook is async and may talk to
+    // the device, which can take hundreds of milliseconds.
+    let Some(record) = state
+        .printers
+        .read()
+        .iter()
+        .find(|p| p.config.name == name)
+        .cloned()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::response::Html("<p>No such printer.</p>".to_string()),
+        );
+    };
+
+    let size_hmm = [form.width_mm as i32 * 100, form.height_mm as i32 * 100];
+    let cfg = &record.config;
+    if cfg.media_size_min.iter().all(|&v| v > 0)
+        && (size_hmm[0] < cfg.media_size_min[0]
+            || size_hmm[1] < cfg.media_size_min[1]
+            || size_hmm[0] > cfg.media_size_max[0]
+            || size_hmm[1] > cfg.media_size_max[1])
+    {
+        let msg = format!(
+            "{}×{}mm is outside the supported range.",
+            form.width_mm, form.height_mm
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::response::Html(media_page(&record, Some(&msg), true)),
+        );
+    }
+
+    let media = crate::device::ReadyMedia {
+        name: format!(
+            "om_{}x{}mm_{}x{}mm",
+            form.width_mm, form.height_mm, form.width_mm, form.height_mm
+        ),
+        size_hmm,
+        media_type: "labels".to_string(),
+    };
+
+    // Ask the consumer first — it owns the device and may refuse. Nothing is
+    // written until it agrees.
+    if let Some(hook) = &state.media_change {
+        if let Err(reason) = hook(name.clone(), media.clone()).await {
+            log::info!("{name}: media change refused: {reason}");
+            return (
+                StatusCode::CONFLICT,
+                axum::response::Html(media_page(&record, Some(&reason), true)),
+            );
+        }
+    }
+
+    let updated = {
+        let mut printers = state.printers.write();
+        let Some(rec) = printers.iter_mut().find(|p| p.config.name == name) else {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::response::Html("<p>No such printer.</p>".to_string()),
+            );
+        };
+        // Publish it as loaded, and add it to the enumerated list so clients
+        // that only read `media-supported` can select it too.
+        rec.ready_media = Some(media.clone());
+        if !rec.config.media_names.contains(&media.name) {
+            rec.config.media_names.push(media.name.clone());
+            rec.config.media_sizes.push(size_hmm);
+        }
+        rec.clone()
+    };
+    Server::persist(&state.printers, &state.state_path);
+    log::info!(
+        "{name}: media set to {}x{}mm",
+        form.width_mm,
+        form.height_mm
+    );
+
+    let msg = format!(
+        "Loaded media set to {}×{}mm.",
+        form.width_mm, form.height_mm
+    );
+    (
+        StatusCode::OK,
+        axum::response::Html(media_page(&updated, Some(&msg), false)),
+    )
+}
+
 async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     let printers = state.printers.read();
     let mut html = String::from(
@@ -251,10 +452,11 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
     for p in printers.iter() {
         let uri = p.config.printer_uri(&state.host, state.port);
         html.push_str(&format!(
-            "<li><b>{}</b> (<code>{}</code>) — <code>{uri}</code> — device <code>{}</code></li>",
+            "<li><b>{}</b> (<code>{}</code>) — <code>{uri}</code> — device <code>{}</code> — <a href=\"/media/{}\">media</a></li>",
             p.config.display_label(),
             p.config.name,
-            p.config.device_uri
+            p.config.device_uri,
+            p.config.name
         ));
     }
     html.push_str(&format!(
@@ -932,7 +1134,7 @@ mod tests {
         assert_eq!(printer_name_from_uri("", "***"), "printer");
     }
 
-    struct NoopBackend;
+    pub(super) struct NoopBackend;
     #[async_trait::async_trait]
     impl DeviceBackend for NoopBackend {
         async fn list(&self) -> Vec<crate::device::DiscoveredDevice> {
@@ -972,6 +1174,7 @@ mod tests {
             port: 0,
             printers: registry,
             print_job,
+            media_change: None,
             state_path: std::env::temp_dir().join(format!("ipp-worker-test-{tag}.json")),
             jobs: crate::job::JobRegistry::new(),
             device_backend: Arc::new(NoopBackend),
@@ -1085,5 +1288,129 @@ mod tests {
         state.jobs.cancel(id);
         let _ = cancel; // cancel() set the flag the worker polls
         assert_eq!(run_to_terminal(&state, id).await, JobState::Canceled);
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::tests::NoopBackend;
+    use super::*;
+    use crate::printer::{PrinterConfig, PrinterRecord, PrinterRegistry};
+
+    fn config(min: [i32; 2], max: [i32; 2]) -> PrinterConfig {
+        PrinterConfig {
+            name: "p".into(),
+            display_name: String::new(),
+            driver_name: "test".into(),
+            make_and_model: "Test".into(),
+            device_id: String::new(),
+            device_uri: "mock://x".into(),
+            dpi: 203,
+            printhead_width_dots: 384,
+            media_names: vec!["om_40x30mm_40x30mm".into()],
+            media_sizes: vec![[4000, 3000]],
+            media_size_min: min,
+            media_size_max: max,
+            darkness: 50,
+            document_formats: vec![],
+        }
+    }
+
+    fn state_with(cfg: PrinterConfig, hook: Option<MediaChangeFn>, tag: &str) -> AppState {
+        let registry: PrinterRegistry =
+            Arc::new(parking_lot::RwLock::new(vec![PrinterRecord::new(cfg)]));
+        AppState {
+            host: "127.0.0.1".into(),
+            port: 0,
+            printers: registry,
+            print_job: Arc::new(|_, _, _| Box::pin(async { JobOutcome::Completed })),
+            media_change: hook,
+            state_path: std::env::temp_dir().join(format!("ipp-media-test-{tag}.json")),
+            jobs: crate::job::JobRegistry::new(),
+            device_backend: Arc::new(NoopBackend),
+        }
+    }
+
+    async fn apply(state: &AppState, w: u32, h: u32) -> StatusCode {
+        media_apply_handler(
+            State(state.clone()),
+            Path("p".to_string()),
+            Form(MediaForm {
+                width_mm: w,
+                height_mm: h,
+            }),
+        )
+        .await
+        .into_response()
+        .status()
+    }
+
+    /// A refusal must leave the config exactly as it was — the whole point of
+    /// the hook is that the consumer can veto a size the device won't accept.
+    #[tokio::test]
+    async fn refused_change_is_not_persisted() {
+        let hook: MediaChangeFn =
+            Arc::new(|_, _| Box::pin(async { Err("genuine RFID roll loaded".to_string()) }));
+        let state = state_with(config([0, 0], [0, 0]), Some(hook), "refuse");
+
+        assert_eq!(apply(&state, 34, 34).await, StatusCode::CONFLICT);
+
+        let printers = state.printers.read();
+        assert!(printers[0].ready_media.is_none(), "ready_media was written");
+        assert_eq!(printers[0].config.media_names.len(), 1, "list grew");
+    }
+
+    /// An accepted change publishes the media and extends the enumerated list,
+    /// so clients reading only `media-supported` can select it too.
+    #[tokio::test]
+    async fn accepted_change_publishes_and_extends_list() {
+        let state = state_with(config([1000, 1000], [5000, 12000]), None, "accept");
+
+        assert_eq!(apply(&state, 34, 34).await, StatusCode::OK);
+
+        let printers = state.printers.read();
+        let ready = printers[0].ready_media.as_ref().expect("ready_media unset");
+        assert_eq!(ready.size_hmm, [3400, 3400]);
+        assert_eq!(ready.name, "om_34x34mm_34x34mm");
+        assert!(printers[0]
+            .config
+            .media_names
+            .contains(&"om_34x34mm_34x34mm".to_string()));
+    }
+
+    /// Out-of-range sizes are rejected before the hook runs, so a consumer
+    /// never sees a size its own config already rules out.
+    #[tokio::test]
+    async fn out_of_range_is_rejected_without_calling_the_hook() {
+        let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = called.clone();
+        let hook: MediaChangeFn = Arc::new(move |_, _| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        let state = state_with(config([1000, 1000], [5000, 12000]), Some(hook), "range");
+
+        assert_eq!(apply(&state, 200, 34).await, StatusCode::BAD_REQUEST);
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Re-applying the same size must not grow the list on every submit.
+    #[tokio::test]
+    async fn repeated_apply_does_not_duplicate() {
+        let state = state_with(config([1000, 1000], [5000, 12000]), None, "dup");
+        apply(&state, 34, 34).await;
+        apply(&state, 34, 34).await;
+        assert_eq!(state.printers.read()[0].config.media_names.len(), 2);
+    }
+
+    /// Config values reach the page as HTML; a name carrying markup must not
+    /// escape into it.
+    #[test]
+    fn page_escapes_config_values() {
+        let mut cfg = config([0, 0], [0, 0]);
+        cfg.display_name = "<script>x</script>".into();
+        let page = media_page(&PrinterRecord::new(cfg), None, false);
+        assert!(!page.contains("<script>"));
+        assert!(page.contains("&lt;script&gt;"));
     }
 }
