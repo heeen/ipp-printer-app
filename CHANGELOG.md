@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.9.0 — 2026-08-22
+
+### Media page and `media_change` hook (breaking)
+
+- **New web UI route `GET`/`POST` /media/{name}.** A desktop print dialog can
+  read `media-ready` but has no way to write it — "this tray now holds 34x34mm
+  labels" is not something GTK/Qt dialogs express. The form shows the currently
+  loaded media (live device data when the poller has any, else the configured
+  default), validates against the custom size bounds when set, and is linked
+  from the index. Previously the router served only `/` and `/icon.png`.
+- **`ServerOptions` gains `media_change`**, mirroring the `PrintJobFn` shape and
+  returning `Result<(), String>` so a consumer can **refuse** a change and have
+  the reason rendered. Only the consumer knows whether the device will accept
+  one: a printer whose media is described by an RFID tag must be able to reject
+  a hand-entered size rather than silently disagree with its own hardware.
+  Nothing is written until the hook agrees.
+
+### Added
+
+- **Custom media size ranges.** `PrinterConfig` gains `media_size_min` /
+  `media_size_max` in hundredths of a millimetre. With both set,
+  `media-size-supported` gains a `rangeOfInteger` entry (PWG 5100.12 permits
+  this, and it is what CUPS reads to derive Custom page-size support) and the
+  PWG `custom_min_*` / `custom_max_*` bookend names join `media-supported`.
+  Both fields are `#[serde(default)]`, so existing state loads unchanged and a
+  printer that leaves them zeroed advertises exactly what it did before.
+  Half-filled and inverted ranges are rejected rather than emitted.
+
+### Fixed
+
+- Custom bookend entries in `media-col-database` carried the wrong size: the
+  names were zipped against the enumerated size list, ran past its end, and
+  picked up the `repeat(default_size)` filler — so `custom_min_10x10mm`
+  advertised a media-size of 4000x3000, contradicting its own name.
+
+## 0.8.0 — 2026-06-26
+
+### Async callbacks (breaking)
+
+- `DeviceBackend`, `RasterDriver` and `PrintJobFn` are now async. Implementors
+  move to `#[async_trait]` and `.await` their device I/O instead of blocking a
+  runtime thread.
+
 ## 0.7.0 — 2026-06-22
 
 Make the framework behave like a real printer when the device isn't ready,
