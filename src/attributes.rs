@@ -393,7 +393,11 @@ pub fn get_printer_attributes(
             attrs,
             p,
             "media-col-default",
-            media_col(media_kws[0], default_size),
+            media_col(
+                media_kws[0],
+                default_size,
+                side_margin_hmm(cfg, default_size[0]),
+            ),
         );
         // Pair each enumerated name with its own size, then append the custom
         // bookends carrying *their* bounds. Zipping the whole keyword list
@@ -408,11 +412,19 @@ pub fn get_printer_attributes(
                     .copied()
                     .chain(std::iter::repeat(default_size)),
             )
-            .map(|(name, size)| media_col(name, size))
+            .map(|(name, size)| media_col(name, size, side_margin_hmm(cfg, size[0])))
             .collect();
         if let Some((min, max)) = custom_range {
-            media_cols.push(media_col(&custom_media_name("min", min), min));
-            media_cols.push(media_col(&custom_media_name("max", max), max));
+            media_cols.push(media_col(
+                &custom_media_name("min", min),
+                min,
+                side_margin_hmm(cfg, min[0]),
+            ));
+            media_cols.push(media_col(
+                &custom_media_name("max", max),
+                max,
+                side_margin_hmm(cfg, max[0]),
+            ));
         }
         // PWG 5100.13: `media-col-supported` is `1setOf keyword` naming the
         // member attributes a client may set in a `media-col` collection — NOT
@@ -474,19 +486,49 @@ pub fn get_printer_attributes(
             attrs,
             p,
             "media-col-ready",
-            IppValue::Array(vec![media_col(ready_name, ready_size)]),
+            IppValue::Array(vec![media_col(
+                ready_name,
+                ready_size,
+                side_margin_hmm(cfg, ready_size[0]),
+            )]),
         );
     }
 
-    // Hard-margin support. A thermal label printer prints edge-to-edge: 0 on
-    // all sides (hundredths of a millimetre). Required by IPP Everywhere.
+    // Hard margins, in hundredths of a millimetre. The feed direction is
+    // unbounded on a roll, so top/bottom are 0; the sides carry whatever the
+    // printhead cannot reach for each advertised width. The supported sets
+    // must contain every value any `media-col-database` entry reports, or a
+    // client is entitled to reject the collection.
     for margin in [
         "media-top-margin-supported",
         "media-bottom-margin-supported",
+    ] {
+        add(attrs, p, margin, IppValue::Integer(0));
+    }
+    let mut side_margins: Vec<i32> = cfg
+        .media_sizes
+        .iter()
+        .map(|s| side_margin_hmm(cfg, s[0]))
+        .collect();
+    if let Some((min, max)) = custom_media_range(cfg) {
+        side_margins.push(side_margin_hmm(cfg, min[0]));
+        side_margins.push(side_margin_hmm(cfg, max[0]));
+    }
+    // Only advertise 0 if some size really is fully printable. CUPS takes the
+    // *maximum* of this set as the page default and emits a borderless variant
+    // for the minimum, so an unconditional 0 keeps a full-width page size on
+    // offer — and picking it puts the artwork straight back under the crop.
+    if side_margins.is_empty() {
+        side_margins.push(0);
+    }
+    side_margins.sort_unstable();
+    side_margins.dedup();
+    let side_margins: Vec<IppValue> = side_margins.into_iter().map(IppValue::Integer).collect();
+    for margin in [
         "media-left-margin-supported",
         "media-right-margin-supported",
     ] {
-        add(attrs, p, margin, IppValue::Integer(0));
+        add(attrs, p, margin, IppValue::Array(side_margins.clone()));
     }
 
     add(
@@ -851,7 +893,7 @@ pub fn set_printer_idle(record: &mut PrinterRecord) {
 
 /// Build a `media-col` collection with `media-size` (x/y in hundredths of mm)
 /// and `media-size-name`. CUPS expects PWG dimensions in hundredths of mm.
-fn media_col(name: &str, size_hmm: [i32; 2]) -> IppValue {
+fn media_col(name: &str, size_hmm: [i32; 2], side_margin_hmm: i32) -> IppValue {
     use std::collections::BTreeMap;
     let mut size = BTreeMap::new();
     size.insert(
@@ -865,7 +907,41 @@ fn media_col(name: &str, size_hmm: [i32; 2]) -> IppValue {
     let mut col = BTreeMap::new();
     col.insert("media-size".try_into().unwrap(), IppValue::Collection(size));
     col.insert("media-size-name".try_into().unwrap(), kw(name));
+    // Feed direction is unbounded on a roll; only the head's width constrains
+    // the imageable area.
+    col.insert("media-top-margin".try_into().unwrap(), IppValue::Integer(0));
+    col.insert(
+        "media-bottom-margin".try_into().unwrap(),
+        IppValue::Integer(0),
+    );
+    col.insert(
+        "media-left-margin".try_into().unwrap(),
+        IppValue::Integer(side_margin_hmm),
+    );
+    col.insert(
+        "media-right-margin".try_into().unwrap(),
+        IppValue::Integer(side_margin_hmm),
+    );
     IppValue::Collection(col)
+}
+
+/// Unprintable border on each side of a sheet `width_hmm` wide, in hundredths
+/// of a millimetre.
+///
+/// A fixed printhead narrower than the media leaves stock it physically cannot
+/// mark. Reporting that as a hard margin is what lets a client compose into the
+/// imageable area — the alternative, claiming the full width, has the client
+/// lay artwork edge to edge and the driver crop the middle out of a finished
+/// page, which is how a barcode loses its quiet zone.
+///
+/// Split evenly: the media runs centred under the head.
+pub(crate) fn side_margin_hmm(cfg: &crate::printer::PrinterConfig, width_hmm: i32) -> i32 {
+    if cfg.dpi <= 0 || cfg.printhead_width_dots == 0 {
+        return 0;
+    }
+    // Printhead width in hundredths of a millimetre.
+    let head_hmm = (cfg.printhead_width_dots as i64 * 2540 / cfg.dpi as i64) as i32;
+    ((width_hmm - head_hmm).max(0)) / 2
 }
 
 /// The configured custom-size bounds, if the printer advertises any.
@@ -936,6 +1012,33 @@ fn uptime_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The head's unreachable stock is reported as a hard margin, per size.
+    /// CUPS takes the maximum of the supported set as the page default, so a
+    /// stray 0 would keep a full-width borderless variant on offer and the
+    /// artwork would be cropped by the driver instead.
+    #[test]
+    fn side_margins_come_from_the_head_width() {
+        let mut cfg = config_with_range([1000, 1000], [5000, 12000]);
+        cfg.dpi = 203;
+        cfg.printhead_width_dots = 384; // 48.04mm
+                                        // A 50mm roll leaves 0.98mm either side.
+        assert_eq!(side_margin_hmm(&cfg, 5000), 98);
+        // Narrower than the head: fully printable.
+        assert_eq!(side_margin_hmm(&cfg, 4000), 0);
+        assert_eq!(side_margin_hmm(&cfg, 4804), 0);
+    }
+
+    /// A printer with no usable geometry must not invent margins.
+    #[test]
+    fn side_margins_are_zero_without_geometry() {
+        let mut cfg = config_with_range([1000, 1000], [5000, 12000]);
+        cfg.dpi = 0;
+        assert_eq!(side_margin_hmm(&cfg, 5000), 0);
+        cfg.dpi = 203;
+        cfg.printhead_width_dots = 0;
+        assert_eq!(side_margin_hmm(&cfg, 5000), 0);
+    }
     use super::*;
     use crate::printer::{PrinterConfig, PrinterRecord};
 

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.10.0 — 2026-08-23
+
+### Hard margins from the printhead (breaking)
+
+- **`media-col` entries now carry per-size hard margins.** A fixed printhead
+  narrower than the media leaves stock it physically cannot mark; reporting that
+  as a margin is what lets a client compose into the imageable area. The
+  alternative — claiming the full width — has the client lay artwork edge to
+  edge and the driver crop the middle out of a finished page, which is how a
+  barcode loses its quiet zone. Feed direction stays 0 (a roll is unbounded);
+  the sides are `(media_width - printhead_width) / 2`, split evenly because the
+  media runs centred under the head.
+- `media-left-margin-supported` / `media-right-margin-supported` are now sets
+  covering every value any `media-col-database` entry reports. `0` appears only
+  when some size genuinely has no margin: CUPS takes the *maximum* of the set as
+  the page default and emits a borderless variant for the minimum, so an
+  unconditional `0` keeps a full-width page size on offer.
+
+### `print-quality` reaches the driver
+
+- **`JobContext` gains `print_quality`** (RFC 8011 enum: 3 draft, 4 normal,
+  5 high) when the client sends it. On a driverless queue this is the only
+  per-job quality signal that survives: CUPS' generated PPD maps
+  `cupsPrintQuality` solely to `HWResolution`, which collapses to one value on a
+  fixed-resolution printer, leaving the raster byte-identical for all three —
+  but `_cupsConvertOptions` still forwards the enum on the job.
+
+### The loaded roll persists
+
+- **A roll reported by the device becomes the printer's media default** and is
+  saved. `PrinterRecord::set_ready_media` puts the size at the front of
+  `media_names` (index 0 is what `media-default` reports) and returns whether
+  anything changed; the status poller persists on a real swap rather than every
+  tick. Previously the poller never persisted, so a restart fell back to a size
+  that was not in the printer. Swapping rolls moves the new size to the front
+  and de-duplicates rather than stacking.
+- `status::spawn` takes the state path (breaking).
+
 ## 0.9.1 — 2026-08-23
 
 ### Fixed

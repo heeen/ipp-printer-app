@@ -40,6 +40,13 @@ pub struct JobContext {
     /// `application/octet-stream` when the client omits it. The print
     /// callback branches on this to pick a decoder.
     pub document_format: String,
+    /// `print-quality` (RFC 8011: 3 draft, 4 normal, 5 high), when the client
+    /// sent it. CUPS derives it from the `cupsPrintQuality` PPD choice, so on
+    /// a driverless queue this is the one per-job quality knob that reaches a
+    /// driver — the generated PPD maps quality only to `HWResolution`, which
+    /// collapses to a single value on a fixed-resolution printer, leaving the
+    /// raster identical for all three.
+    pub print_quality: Option<u8>,
 }
 
 impl JobContext {
@@ -189,6 +196,7 @@ impl Server {
             opts.device_backend.clone(),
             opts.printers.clone(),
             advertiser.clone(),
+            opts.state_path.clone(),
         );
         // Hold the advertiser for the server's lifetime (Drop withdraws all).
         let _advertiser = advertiser;
@@ -635,6 +643,7 @@ async fn handle_ipp(
         }
         Operation::PrintJob => {
             let copies = extract_copies(&req);
+            let quality = extract_print_quality(&req);
             let format = extract_document_format(&req);
             let mut payload = Vec::new();
             req.payload_mut()
@@ -646,7 +655,15 @@ async fn handle_ipp(
             let accepted = print_job_accepted(version, request_id, &job, &printer_uri_str)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-            spawn_print_worker(state, name.to_string(), job, payload, copies, format);
+            spawn_print_worker(
+                state,
+                name.to_string(),
+                job,
+                payload,
+                copies,
+                format,
+                quality,
+            );
             accepted
         }
         Operation::CreateJob => {
@@ -681,6 +698,7 @@ async fn handle_ipp(
                 .get(job_id)
                 .ok_or((StatusCode::NOT_FOUND, format!("job not found: {job_id}")))?;
             let copies = extract_copies(&req);
+            let quality = extract_print_quality(&req);
             let format = extract_document_format(&req);
             let mut payload = Vec::new();
             req.payload_mut()
@@ -695,6 +713,7 @@ async fn handle_ipp(
                     payload,
                     copies,
                     format,
+                    quality,
                 );
             }
             let printer_uri_str = record.config.printer_uri(&state.host, state.port);
@@ -831,6 +850,22 @@ fn extract_job_id(req: &IppRequestResponse) -> Option<JobId> {
     None
 }
 
+/// Read the `print-quality` job attribute (enum 3/4/5), if present.
+fn extract_print_quality(req: &IppRequestResponse) -> Option<u8> {
+    for group in req.attributes().groups() {
+        for attr in group.attributes().values() {
+            if attr.name().as_str() == "print-quality" {
+                if let IppValue::Enum(n) = attr.value() {
+                    if (3..=5).contains(n) {
+                        return Some(*n as u8);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn extract_copies(req: &IppRequestResponse) -> u32 {
     for group in req.attributes().groups() {
         for attr in group.attributes().values() {
@@ -952,6 +987,7 @@ fn spawn_print_worker(
     payload: Vec<u8>,
     copies: u32,
     document_format: String,
+    print_quality: Option<u8>,
 ) {
     let state_clone = state.clone();
     let name_owned = printer_name;
@@ -978,6 +1014,7 @@ fn spawn_print_worker(
             printer_name: name_owned.clone(),
             cancel_flag: job_for_worker.cancel_flag.clone(),
             document_format,
+            print_quality,
         };
 
         // Retry/hold loop. A `DeviceUnavailable` outcome holds the job
@@ -1100,6 +1137,47 @@ async fn sleep_cancelable(
 
 #[cfg(test)]
 mod tests {
+
+    /// An empty Print-Job request to hang job attributes on.
+    fn job_request() -> IppRequestResponse {
+        IppRequestResponse::new(
+            ipp::model::IppVersion::v2_0(),
+            ipp::model::Operation::PrintJob,
+            Some("ipp://localhost/ipp/print".parse().unwrap()),
+        )
+        .expect("build request")
+    }
+
+    /// CUPS converts the `cupsPrintQuality` PPD choice into a `print-quality`
+    /// enum on the outgoing job (`_cupsConvertOptions`), so this is the one
+    /// per-job quality signal that survives to a driverless printer — the
+    /// generated PPD maps all three qualities onto the same `HWResolution` for
+    /// a fixed-resolution device, leaving the raster byte-identical.
+    #[test]
+    fn print_quality_is_read_from_the_job_group() {
+        for (sent, want) in [(3i32, Some(3u8)), (4, Some(4)), (5, Some(5))] {
+            let mut req = job_request();
+            req.attributes_mut().add(
+                DelimiterTag::JobAttributes,
+                IppAttribute::new("print-quality".try_into().unwrap(), IppValue::Enum(sent)),
+            );
+            assert_eq!(extract_print_quality(&req), want, "quality {sent}");
+        }
+    }
+
+    /// Absent, or outside the enum, means "no opinion" — the driver keeps its
+    /// configured darkness rather than inventing one.
+    #[test]
+    fn absent_or_invalid_print_quality_is_none() {
+        assert_eq!(extract_print_quality(&job_request()), None);
+
+        let mut odd = job_request();
+        odd.attributes_mut().add(
+            DelimiterTag::JobAttributes,
+            IppAttribute::new("print-quality".try_into().unwrap(), IppValue::Enum(9)),
+        );
+        assert_eq!(extract_print_quality(&odd), None);
+    }
     use super::*;
     use crate::device::DeviceBackend;
     use crate::flags::PrinterReason;
@@ -1221,6 +1299,7 @@ mod tests {
             vec![1, 2, 3],
             1,
             "image/pwg-raster".into(),
+            None,
         );
 
         assert_eq!(
@@ -1250,7 +1329,7 @@ mod tests {
         let state = test_state(print_job, "fail");
         let job = state.jobs.create("p".into(), "tester".into());
         let id = job.id;
-        spawn_print_worker(&state, "p".into(), job, vec![0], 1, "x".into());
+        spawn_print_worker(&state, "p".into(), job, vec![0], 1, "x".into(), None);
 
         assert_eq!(run_to_terminal(&state, id).await, JobState::Aborted);
         assert_eq!(
@@ -1276,7 +1355,7 @@ mod tests {
         let job = state.jobs.create("p".into(), "tester".into());
         let id = job.id;
         let cancel = job.cancel_flag.clone();
-        spawn_print_worker(&state, "p".into(), job, vec![0], 1, "x".into());
+        spawn_print_worker(&state, "p".into(), job, vec![0], 1, "x".into(), None);
         // Let it hold a couple of rounds, then cancel.
         tokio::time::sleep(Duration::from_millis(40)).await;
         state.jobs.cancel(id);

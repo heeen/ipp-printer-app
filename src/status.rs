@@ -37,6 +37,7 @@ pub fn spawn(
     backend: Arc<dyn DeviceBackend>,
     registry: PrinterRegistry,
     advertiser: Option<Arc<dyn AdvertiserControl>>,
+    state_path: std::path::PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     let interval = std::env::var("IPP_PRINTER_APP_POLL_SECS")
         .ok()
@@ -52,16 +53,25 @@ pub fn spawn(
         ticker.tick().await; // immediate first tick
         loop {
             ticker.tick().await;
-            poll_once(backend.as_ref(), &registry, advertiser.as_deref()).await;
+            let media_changed = poll_once(backend.as_ref(), &registry, advertiser.as_deref()).await;
+            // The loaded roll is part of the printer's configuration, so a swap
+            // has to outlive the process. Only on an actual change — this loop
+            // runs every few seconds.
+            if media_changed {
+                crate::server::Server::persist(&registry, &state_path);
+            }
         }
     })
 }
 
+/// Returns whether any printer's loaded media changed, so the caller can
+/// persist the registry.
 async fn poll_once(
     backend: &dyn DeviceBackend,
     registry: &PrinterRegistry,
     advertiser: Option<&dyn AdvertiserControl>,
-) {
+) -> bool {
+    let mut media_changed = false;
     use crate::flags::PrinterReason;
     use crate::printer::IppPrinterState;
     // Snapshot printers that aren't actively printing. We poll Idle AND Stopped
@@ -116,7 +126,7 @@ async fn poll_once(
                 }
                 // Carry forward last-known media/supply when a poll omits them.
                 if let Some(media) = status.ready_media {
-                    rec.set_ready_media(media);
+                    media_changed |= rec.set_ready_media(media);
                 }
                 if status.supply_percent.is_some() {
                     rec.supply_percent = status.supply_percent;
@@ -144,6 +154,7 @@ async fn poll_once(
             }
         }
     }
+    media_changed
 }
 
 #[cfg(test)]

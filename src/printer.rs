@@ -124,25 +124,49 @@ impl PrinterRecord {
         }
     }
 
-    /// Record `media` as the loaded roll, and enumerate it as supported.
+    /// Record `media` as the loaded roll: publish it, enumerate it as
+    /// supported, and make it this printer's default.
     ///
-    /// `media-ready` alone is not enough to make a size selectable: a print
+    /// `media-ready` alone is not enough to make a size selectable — a print
     /// dialog builds its list from `media-supported`, and CUPS rejects a
-    /// `media` value that is not in it. A printer that reports a roll the
-    /// config never listed would otherwise advertise a size nothing can ask
-    /// for — which is what an RFID-tagged 50x80 roll did on a T50 whose table
-    /// stopped at 50x30.
+    /// `media` value that is not in it. A printer reporting a roll the config
+    /// never listed would advertise a size nothing can ask for, which is what
+    /// an RFID-tagged 50x80 roll did on a T50 whose table stopped at 50x30.
     ///
-    /// Appending keeps `media-default` (the first entry) stable. The status
-    /// poller does not persist, so sizes learned from the device last only as
-    /// long as the process — a roll that is never loaded again does not
-    /// accumulate in the saved config.
-    pub fn set_ready_media(&mut self, media: crate::device::ReadyMedia) {
-        if !self.config.media_names.contains(&media.name) {
-            self.config.media_names.push(media.name.clone());
-            self.config.media_sizes.push(media.size_hmm);
+    /// The size goes to the *front*, because index 0 is what
+    /// `media-default` / `media-col-default` report. Whatever is physically
+    /// loaded is the sensible default, and it stays that way until another
+    /// roll is loaded or the operator sets one through the media page — which
+    /// arrives here too.
+    ///
+    /// Returns whether anything changed, so a caller polling every few seconds
+    /// can persist only on a real roll swap.
+    pub fn set_ready_media(&mut self, media: crate::device::ReadyMedia) -> bool {
+        let was_default = self.config.media_names.first() == Some(&media.name);
+        if !was_default {
+            // Drop any existing entry before re-inserting at the front, so the
+            // list cannot accumulate duplicates across roll swaps. `media_sizes`
+            // is index-aligned with `media_names` but may be shorter (callers
+            // are allowed to leave the tail to the default size), so only
+            // remove a size that actually exists.
+            if let Some(i) = self
+                .config
+                .media_names
+                .iter()
+                .position(|n| *n == media.name)
+            {
+                self.config.media_names.remove(i);
+                if i < self.config.media_sizes.len() {
+                    self.config.media_sizes.remove(i);
+                }
+            }
+            self.config.media_names.insert(0, media.name.clone());
+            self.config.media_sizes.insert(0, media.size_hmm);
         }
+        let changed =
+            !was_default || self.ready_media.as_ref().map(|m| m.size_hmm) != Some(media.size_hmm);
         self.ready_media = Some(media);
+        changed
     }
 }
 
@@ -239,8 +263,44 @@ mod tests {
             .iter()
             .any(|n| n == "om_50x80mm_50x80mm"));
         assert!(rec.config.media_sizes.contains(&[5000, 8000]));
-        // media-default is the first entry; learning a roll must not move it.
+        // Index 0 is what media-default reports, and the loaded roll is the
+        // sensible default — a restart must not fall back to a size that is
+        // not in the printer.
+        assert_eq!(rec.config.media_names[0], "om_50x80mm_50x80mm");
+        assert_eq!(rec.config.media_sizes[0], [5000, 8000]);
+    }
+
+    /// Swapping rolls must not stack the old size in front, nor duplicate an
+    /// entry the table already had.
+    #[test]
+    fn swapping_rolls_keeps_the_list_tidy() {
+        let mut rec = PrinterRecord::new(t50_config());
+        let roll = |w: i32, h: i32| crate::device::ReadyMedia {
+            name: format!("om_{}x{}mm_{}x{}mm", w / 100, h / 100, w / 100, h / 100),
+            size_hmm: [w, h],
+            media_type: "labels".into(),
+        };
+
+        assert!(
+            rec.set_ready_media(roll(5000, 8000)),
+            "first load is a change"
+        );
+        assert!(!rec.set_ready_media(roll(5000, 8000)), "same roll is not");
+        assert!(rec.set_ready_media(roll(4000, 3000)), "swap is a change");
+
+        // 40x30 was already enumerated; it moved to the front rather than
+        // being added a second time.
         assert_eq!(rec.config.media_names[0], "om_40x30mm_40x30mm");
+        assert_eq!(
+            rec.config
+                .media_names
+                .iter()
+                .filter(|n| *n == "om_40x30mm_40x30mm")
+                .count(),
+            1,
+            "duplicate entry"
+        );
+        assert_eq!(rec.config.media_names.len(), rec.config.media_sizes.len());
     }
 
     /// Re-reporting the same roll every poll must not grow the list.
