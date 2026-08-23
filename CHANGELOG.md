@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.1 — 2026-08-23
+
+### Fixed
+
+- **A roll the device reports is now selectable, not just advertised.** The
+  status poller set `media-ready` from live device data but never added the size
+  to `media-supported`, so a printer could report a loaded roll that no client
+  could then ask for — a print dialog builds its list from `media-supported`,
+  and CUPS rejects a `media` value absent from it. Observed on a Supvan T50 with
+  an RFID-tagged 50x80mm roll against a config whose table stopped at 50x30.
+  The web-UI media form already folded its size in; both paths now share
+  `PrinterRecord::set_ready_media`. The poller does not persist, so sizes
+  learned from the device last only for the life of the process.
+
 ## 0.9.0 — 2026-08-22
 
 ### Media page and `media_change` hook (breaking)

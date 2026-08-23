@@ -417,13 +417,7 @@ async fn media_apply_handler(
                 axum::response::Html("<p>No such printer.</p>".to_string()),
             );
         };
-        // Publish it as loaded, and add it to the enumerated list so clients
-        // that only read `media-supported` can select it too.
-        rec.ready_media = Some(media.clone());
-        if !rec.config.media_names.contains(&media.name) {
-            rec.config.media_names.push(media.name.clone());
-            rec.config.media_sizes.push(size_hmm);
-        }
+        rec.set_ready_media(media.clone());
         rec.clone()
     };
     Server::persist(&state.printers, &state.state_path);

@@ -115,8 +115,8 @@ async fn poll_once(
                     rec.state = want;
                 }
                 // Carry forward last-known media/supply when a poll omits them.
-                if status.ready_media.is_some() {
-                    rec.ready_media = status.ready_media;
+                if let Some(media) = status.ready_media {
+                    rec.set_ready_media(media);
                 }
                 if status.supply_percent.is_some() {
                     rec.supply_percent = status.supply_percent;

@@ -123,6 +123,27 @@ impl PrinterRecord {
             config,
         }
     }
+
+    /// Record `media` as the loaded roll, and enumerate it as supported.
+    ///
+    /// `media-ready` alone is not enough to make a size selectable: a print
+    /// dialog builds its list from `media-supported`, and CUPS rejects a
+    /// `media` value that is not in it. A printer that reports a roll the
+    /// config never listed would otherwise advertise a size nothing can ask
+    /// for — which is what an RFID-tagged 50x80 roll did on a T50 whose table
+    /// stopped at 50x30.
+    ///
+    /// Appending keeps `media-default` (the first entry) stable. The status
+    /// poller does not persist, so sizes learned from the device last only as
+    /// long as the process — a roll that is never loaded again does not
+    /// accumulate in the saved config.
+    pub fn set_ready_media(&mut self, media: crate::device::ReadyMedia) {
+        if !self.config.media_names.contains(&media.name) {
+            self.config.media_names.push(media.name.clone());
+            self.config.media_sizes.push(media.size_hmm);
+        }
+        self.ready_media = Some(media);
+    }
 }
 
 /// Borrowed view of a printer passed into [`crate::RasterDriver`] callbacks.
@@ -171,5 +192,70 @@ mod tests {
         }"#;
         let cfg: PrinterConfig = serde_json::from_str(json).expect("back-compat load");
         assert!(cfg.document_formats.is_empty());
+    }
+
+    /// A minimal config with one enumerated size, standing in for a T50 whose
+    /// table stops short of the roll that is actually loaded.
+    fn t50_config() -> PrinterConfig {
+        PrinterConfig {
+            name: "t50".into(),
+            display_name: String::new(),
+            driver_name: "supvan_t50".into(),
+            make_and_model: "Supvan T50 Series".into(),
+            device_id: String::new(),
+            device_uri: "mock://x".into(),
+            dpi: 203,
+            printhead_width_dots: 384,
+            media_names: vec!["om_40x30mm_40x30mm".into()],
+            media_sizes: vec![[4000, 3000]],
+            media_size_min: [0, 0],
+            media_size_max: [0, 0],
+            darkness: 50,
+            document_formats: vec![],
+        }
+    }
+
+    /// A roll the device reports but the config never listed has to join
+    /// `media-supported`, not just `media-ready` — otherwise it is advertised
+    /// as loaded while remaining impossible to select. This is the RFID-tagged
+    /// 50x80 case on a T50 whose table stopped at 50x30.
+    #[test]
+    fn device_reported_media_becomes_selectable() {
+        let mut rec = PrinterRecord::new(t50_config());
+
+        rec.set_ready_media(crate::device::ReadyMedia {
+            name: "om_50x80mm_50x80mm".into(),
+            size_hmm: [5000, 8000],
+            media_type: "labels".into(),
+        });
+
+        assert_eq!(
+            rec.ready_media.as_ref().map(|m| m.name.as_str()),
+            Some("om_50x80mm_50x80mm")
+        );
+        assert!(rec
+            .config
+            .media_names
+            .iter()
+            .any(|n| n == "om_50x80mm_50x80mm"));
+        assert!(rec.config.media_sizes.contains(&[5000, 8000]));
+        // media-default is the first entry; learning a roll must not move it.
+        assert_eq!(rec.config.media_names[0], "om_40x30mm_40x30mm");
+    }
+
+    /// Re-reporting the same roll every poll must not grow the list.
+    #[test]
+    fn relearning_the_same_roll_is_idempotent() {
+        let mut rec = PrinterRecord::new(t50_config());
+        let media = crate::device::ReadyMedia {
+            name: "om_50x80mm_50x80mm".into(),
+            size_hmm: [5000, 8000],
+            media_type: "labels".into(),
+        };
+        for _ in 0..5 {
+            rec.set_ready_media(media.clone());
+        }
+        assert_eq!(rec.config.media_names.len(), 2);
+        assert_eq!(rec.config.media_sizes.len(), 2);
     }
 }
