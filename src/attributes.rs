@@ -270,8 +270,15 @@ pub fn get_printer_attributes(
         "document-format-default",
         mime("image/pwg-raster"),
     );
-    // PWG raster type for the everywhere driver.
-    add_array_keyword(attrs, p, "pwg-raster-document-type-supported", &["black_1"]);
+    // Contone types let CUPS rasterize vectors into full-page PWG
+    // `black_1` alone makes some filters fail and emit tiny broken pages.
+    // Consumers may dither 8/24 bpp down to 1-bit, so print-color-mode stays mono.
+    add_array_keyword(
+        attrs,
+        p,
+        "pwg-raster-document-type-supported",
+        &["black_1", "sgray_8", "srgb_8"],
+    );
     // PWG 5102.4 §6.2.1: `1setOf resolution`. CUPS 2.4.16+ (Ubuntu 26.04)
     // requires this typing; 2.4.10 (Debian trixie) regrettably has a bug
     // and looks it up as IPP_TAG_KEYWORD instead — the spec form wins.
@@ -1073,6 +1080,33 @@ mod tests {
         assert_eq!(
             custom_media_name("min", [1000, 1500]),
             "custom_min_10x15mm_10x15mm"
+        );
+    }
+
+    /// CUPS needs sgray_8 / srgb_8 (alongside black_1) to rasterize vector jobs
+    /// into full-page PWG. Keyword spelling matches ipp-everywhere.test.
+    #[test]
+    fn pwg_document_types_include_contone() {
+        let value = printer_attr(
+            config_with_range([0, 0], [0, 0]),
+            "pwg-raster-document-type-supported",
+        );
+        let keywords: Vec<String> = value.into_iter().map(|v| v.to_string()).collect();
+        assert!(
+            keywords.iter().any(|k| k == "black_1"),
+            "missing black_1 in {keywords:?}"
+        );
+        assert!(
+            keywords.iter().any(|k| k == "sgray_8"),
+            "missing sgray_8 in {keywords:?}"
+        );
+        assert!(
+            keywords.iter().any(|k| k == "srgb_8"),
+            "missing srgb_8 in {keywords:?}"
+        );
+        assert!(
+            !keywords.iter().any(|k| k == "srgb_16"),
+            "must not advertise unsupported srgb_16: {keywords:?}"
         );
     }
 }
