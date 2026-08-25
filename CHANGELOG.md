@@ -34,6 +34,16 @@
   names were zipped against the enumerated size list, ran past its end, and
   picked up the `repeat(default_size)` filler — so `custom_min_10x10mm`
   advertised a media-size of 4000x3000, contradicting its own name.
+- **`pwg-raster-document-type-supported` was only `black_1`.**
+  CUPS Everywhere needs `sgray_8` / `srgb_8` to rasterize vectors into
+  a full-page PWG job - with `black_1` alone some filters fail and emit tiny,
+  broken pages. The attribute now lists `black_1`, `sgray_8`, and `srgb_8`
+  (aligned with the existing URF `W8`/`SRGB24` advertisement).
+  `print-color-mode` stays monochrome — consumers may dither contone down to 1-bit.
+- **`media-default` / `media-col-default` ignored the loaded roll.**
+  These attributes always used the first enumerated size, so CUPS Everywhere PPDs
+  could stick on a stale default while `media-ready` already reflected the roll.
+  Both now follow `ready_media` when the status poller has one.
 
 ## 0.8.0 — 2026-06-26
 

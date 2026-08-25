@@ -270,8 +270,15 @@ pub fn get_printer_attributes(
         "document-format-default",
         mime("image/pwg-raster"),
     );
-    // PWG raster type for the everywhere driver.
-    add_array_keyword(attrs, p, "pwg-raster-document-type-supported", &["black_1"]);
+    // Contone types let CUPS rasterize vectors into full-page PWG
+    // `black_1` alone makes some filters fail and emit tiny broken pages.
+    // Consumers may dither 8/24 bpp down to 1-bit, so print-color-mode stays mono.
+    add_array_keyword(
+        attrs,
+        p,
+        "pwg-raster-document-type-supported",
+        &["black_1", "sgray_8", "srgb_8"],
+    );
     // PWG 5102.4 §6.2.1: `1setOf resolution`. CUPS 2.4.16+ (Ubuntu 26.04)
     // requires this typing; 2.4.10 (Debian trixie) regrettably has a bug
     // and looks it up as IPP_TAG_KEYWORD instead — the spec form wins.
@@ -384,16 +391,23 @@ pub fn get_printer_attributes(
         .collect();
 
     if !media_kws.is_empty() {
-        add(attrs, p, "media-default", kw(media_kws[0]));
+        // Prefer the loaded roll as media-default so CUPS Everywhere PPDs do
+        // not stick on the first enumerated size (or custom_min) after a
+        // Get-Printer-Attributes refresh.
+        let fallback_size = cfg.media_sizes.first().copied().unwrap_or([4000, 3000]);
+        let (default_name, default_size) = match &record.ready_media {
+            Some(rm) => (rm.name.as_str(), rm.size_hmm),
+            None => (media_kws[0], fallback_size),
+        };
+        add(attrs, p, "media-default", kw(default_name));
         add_array_keyword(attrs, p, "media-supported", &media_kws);
 
         // media-col-{default} — required by IPP Everywhere.
-        let default_size = cfg.media_sizes.first().copied().unwrap_or([4000, 3000]);
         add(
             attrs,
             p,
             "media-col-default",
-            media_col(media_kws[0], default_size),
+            media_col(default_name, default_size),
         );
         // Pair each enumerated name with its own size, then append the custom
         // bookends carrying *their* bounds. Zipping the whole keyword list
@@ -406,7 +420,7 @@ pub fn get_printer_attributes(
                 cfg.media_sizes
                     .iter()
                     .copied()
-                    .chain(std::iter::repeat(default_size)),
+                    .chain(std::iter::repeat(fallback_size)),
             )
             .map(|(name, size)| media_col(name, size))
             .collect();
@@ -467,7 +481,7 @@ pub fn get_printer_attributes(
         // back to the configured default so the (required) attributes exist.
         let (ready_name, ready_size) = match &record.ready_media {
             Some(rm) => (rm.name.as_str(), rm.size_hmm),
-            None => (media_kws[0], default_size),
+            None => (default_name, default_size),
         };
         add(attrs, p, "media-ready", kw(ready_name));
         add(
@@ -1074,5 +1088,53 @@ mod tests {
             custom_media_name("min", [1000, 1500]),
             "custom_min_10x15mm_10x15mm"
         );
+    }
+
+    /// CUPS needs sgray_8 / srgb_8 (alongside black_1) to rasterize vector jobs
+    /// into full-page PWG. Keyword spelling matches ipp-everywhere.test.
+    #[test]
+    fn pwg_document_types_include_contone() {
+        let value = printer_attr(
+            config_with_range([0, 0], [0, 0]),
+            "pwg-raster-document-type-supported",
+        );
+        let keywords: Vec<String> = value.into_iter().map(|v| v.to_string()).collect();
+        assert!(
+            keywords.iter().any(|k| k == "black_1"),
+            "missing black_1 in {keywords:?}"
+        );
+        assert!(
+            keywords.iter().any(|k| k == "sgray_8"),
+            "missing sgray_8 in {keywords:?}"
+        );
+        assert!(
+            keywords.iter().any(|k| k == "srgb_8"),
+            "missing srgb_8 in {keywords:?}"
+        );
+        assert!(
+            !keywords.iter().any(|k| k == "srgb_16"),
+            "must not advertise unsupported srgb_16: {keywords:?}"
+        );
+    }
+
+    #[test]
+    fn media_default_follows_ready_media() {
+        let mut record = PrinterRecord::new(config_with_range([0, 0], [0, 0]));
+        record.ready_media = Some(crate::device::ReadyMedia {
+            name: "om_50x80mm_50x80mm".into(),
+            size_hmm: [5000, 8000],
+            media_type: "labels".into(),
+        });
+        let resp = get_printer_attributes(IppVersion::v2_0(), 1, &record, "localhost", 8631, None)
+            .unwrap();
+        let default = resp
+            .attributes()
+            .groups_of(DelimiterTag::PrinterAttributes)
+            .flat_map(|g| g.attributes().values())
+            .find(|a| a.name().as_ref() == "media-default")
+            .expect("media-default missing")
+            .value()
+            .to_string();
+        assert_eq!(default, "om_50x80mm_50x80mm");
     }
 }
