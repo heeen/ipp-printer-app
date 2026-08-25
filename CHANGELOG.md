@@ -40,6 +40,10 @@
   broken pages. The attribute now lists `black_1`, `sgray_8`, and `srgb_8`
   (aligned with the existing URF `W8`/`SRGB24` advertisement).
   `print-color-mode` stays monochrome — consumers may dither contone down to 1-bit.
+- **`media-default` / `media-col-default` ignored the loaded roll.**
+  These attributes always used the first enumerated size, so CUPS Everywhere PPDs
+  could stick on a stale default while `media-ready` already reflected the roll.
+  Both now follow `ready_media` when the status poller has one.
 
 ## 0.8.0 — 2026-06-26
 
