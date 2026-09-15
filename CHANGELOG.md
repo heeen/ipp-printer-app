@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.0 — 2026-08-23
+## 0.10.0 — 2026-09-15
 
 ### Hard margins from the printhead (breaking)
 
@@ -38,7 +38,7 @@
   and de-duplicates rather than stacking.
 - `status::spawn` takes the state path (breaking).
 
-## 0.9.1 — 2026-08-23
+## 0.9.1 — 2026-08-23 (never released separately; folded into 0.10.0)
 
 ### Fixed
 
