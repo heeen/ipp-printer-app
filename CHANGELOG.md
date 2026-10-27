@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **mDNS listens only where it advertises.** The daemon used to bind every
+  interface, loopback and container veths included, and parse every packet
+  arriving on any of them; now it is limited to the interfaces it advertises
+  on. `IPP_PRINTER_APP_MDNS_IFACES` (comma-separated names) replaces the
+  automatic choice of every up, non-loopback, non-virtual interface.
+
 ## 0.10.0 — 2026-09-15
 
 ### Hard margins from the printhead (breaking)

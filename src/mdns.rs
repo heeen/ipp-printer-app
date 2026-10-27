@@ -8,13 +8,17 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use parking_lot::Mutex;
 
 use crate::printer::{PrinterRecord, PrinterRegistry};
 use crate::status::AdvertiserControl;
 
 const IPP_SERVICE: &str = "_ipp._tcp.local.";
+
+/// Comma-separated interface names to run mDNS on, replacing the automatic
+/// choice (every up, non-loopback interface that isn't a virtual bridge).
+const IFACES_ENV: &str = "IPP_PRINTER_APP_MDNS_IFACES";
 
 /// Interface name prefixes for container / VM virtual bridges and veth pairs.
 ///
@@ -45,11 +49,21 @@ pub struct Advertiser {
 impl Advertiser {
     /// Start a daemon and register every printer in the registry.
     pub fn register_all(registry: &PrinterRegistry, port: u16) -> mdns_sd::Result<Self> {
+        let daemon = ServiceDaemon::new()?;
+        let ifaces = mdns_ifaces(std::env::var(IFACES_ENV).ok().as_deref());
+        if !ifaces.is_empty() {
+            // Listen where we advertise. mdns-sd otherwise binds every
+            // interface, including loopback and each container veth, and
+            // parses every packet seen on any of them.
+            daemon.disable_interface(IfKind::All)?;
+            let names: Vec<IfKind> = ifaces.iter().map(|i| IfKind::from(&i.name)).collect();
+            daemon.enable_interface(names)?;
+        }
         let me = Self {
-            daemon: ServiceDaemon::new()?,
+            daemon,
             port,
             host: hostname(),
-            addrs: advertise_addrs(),
+            addrs: ifaces.iter().map(if_addrs::Interface::ip).collect(),
             registered: Mutex::new(HashMap::new()),
         };
         for rec in registry.read().iter() {
@@ -116,37 +130,36 @@ fn is_virtual_iface(name: &str) -> bool {
     VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// The host addresses to advertise on: every up, non-loopback, non-link-local
-/// interface that isn't a container/VM virtual bridge. Replaces mdns-sd's
-/// `enable_addr_auto()` (which advertises on *all* interfaces, including the
-/// `veth*`/`br-*` links that defeat `cups-browsed` dedup — see
-/// [`VIRTUAL_IFACE_PREFIXES`]). Returns empty if enumeration fails or filters
-/// everything out, in which case the caller falls back to `enable_addr_auto()`.
-fn advertise_addrs() -> Vec<IpAddr> {
+/// The interface addresses to run mDNS on, link-local ones aside: those of the
+/// interfaces named in `allow` (the [`IFACES_ENV`] value) when given, else of
+/// every up, non-loopback interface that isn't a container/VM virtual bridge.
+/// Replaces mdns-sd's default of all interfaces, which includes the
+/// `veth*`/`br-*` links that defeat `cups-browsed` dedup (see
+/// [`VIRTUAL_IFACE_PREFIXES`]). Empty if enumeration fails or nothing
+/// qualifies, in which case the caller leaves mdns-sd on all interfaces.
+fn mdns_ifaces(allow: Option<&str>) -> Vec<if_addrs::Interface> {
     let ifaces = match if_addrs::get_if_addrs() {
         Ok(i) => i,
         Err(e) => {
-            log::warn!("mdns: interface enumeration failed ({e}); advertising on all interfaces");
+            log::warn!("mdns: interface enumeration failed ({e}); using all interfaces");
             return Vec::new();
         }
     };
-    let mut addrs = Vec::new();
-    for iface in ifaces {
-        if iface.is_loopback() || iface.is_link_local() || !iface.is_oper_up() {
-            continue;
-        }
-        if is_virtual_iface(&iface.name) {
-            log::debug!(
-                "mdns: skipping virtual interface {} ({})",
-                iface.name,
-                iface.ip()
-            );
-            continue;
-        }
-        log::debug!("mdns: advertising on {} ({})", iface.name, iface.ip());
-        addrs.push(iface.ip());
+    let chosen: Vec<_> = ifaces
+        .into_iter()
+        .filter(|iface| !iface.is_link_local())
+        .filter(|iface| match allow {
+            Some(allow) => allow.split(',').any(|n| n.trim() == iface.name),
+            None => !iface.is_loopback() && iface.is_oper_up() && !is_virtual_iface(&iface.name),
+        })
+        .collect();
+    for iface in &chosen {
+        log::debug!("mdns: using {} ({})", iface.name, iface.ip());
     }
-    addrs
+    if chosen.is_empty() && allow.is_some() {
+        log::warn!("mdns: no interface matches {IFACES_ENV}; using all interfaces");
+    }
+    chosen
 }
 
 fn hostname() -> String {
@@ -203,7 +216,7 @@ fn service_info(
     // Advertise an explicit, filtered address list when we have one; otherwise
     // fall back to mdns-sd's auto-detection (all interfaces). The filtered list
     // excludes container/VM virtual bridges so a co-resident `cups-browsed`
-    // doesn't see us over `veth*`/`br-*` links (see `advertise_addrs`).
+    // doesn't see us over `veth*`/`br-*` links (see `mdns_ifaces`).
     let info = if addrs.is_empty() {
         ServiceInfo::new(
             IPP_SERVICE,

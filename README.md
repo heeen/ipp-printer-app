@@ -89,7 +89,7 @@ runnable version.
 | HTTP server | `axum` 0.8 on `tokio` |
 | Job lifecycle | `JobRegistry` with monotonic ids, `Get-Jobs` / `Get-Job-Attributes` / `Cancel-Job` |
 | Live status | Background poll loop calling `DeviceBackend::poll_status`, configurable cadence (`IPP_PRINTER_APP_POLL_SECS`, default 30 s) |
-| Discovery | mDNS `_ipp._tcp.local.` via `mdns-sd`, default-on `mdns` feature |
+| Discovery | mDNS `_ipp._tcp.local.` via `mdns-sd`, default-on `mdns` feature; runs on every up, non-loopback, non-virtual interface, or on the comma-separated names in `IPP_PRINTER_APP_MDNS_IFACES` |
 | State | JSON registry persisted at `$XDG_STATE_HOME/<app-id>.state.json` |
 | Raster format | PWG raster + legacy CUPS raster v1/v2 via [`print_raster`](https://crates.io/crates/print_raster) |
 
